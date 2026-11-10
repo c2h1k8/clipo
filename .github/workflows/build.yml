@@ -3,7 +3,7 @@ name: build
 # - PR: Mac と Windows でコンパイルが通るかだけ確認（速い。配布用ビルドはしない）
 # - main への push でバージョン（tauri.conf.json）が新しくなっていたら:
 #   CI がタグ v<version> を打って下書き Release を作り、両 OS の配布用ビルドを添付してから公開する
-# - main への push でもバージョンが同じなら何もしない（PR で確認済み）
+# - main への push でもバージョンが同じならコンパイル確認だけ（キャッシュを main に残すため）
 # ドキュメントだけの変更ではビルドしない（バージョンを上げる変更は package.json 等を含むので必ず動く）
 on:
   push:
@@ -36,7 +36,7 @@ jobs:
       release: ${{ steps.v.outputs.release }}
       release_id: ${{ steps.draft.outputs.id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Read version / decide whether to release
         id: v
@@ -73,9 +73,13 @@ jobs:
           - **Mac**: dmg からアプリケーションへ移したあと、Finder で Clipo を右クリック →「開く」
           - **Windows**: SmartScreen の「詳細情報」→「実行」
           EOF
+          # 作成直後は一覧 API に出てこないことがあるので、タグ名で直接引いて再試行する
           find_id() {
-            gh api "repos/${{ github.repository }}/releases" --paginate \
-              --jq ".[] | select(.tag_name == \"v$VERSION\") | .id" | head -1
+            for n in 1 2 3 4 5 6; do
+              id=$(gh release view "v$VERSION" --json databaseId -q .databaseId 2>/dev/null || true)
+              [ -n "$id" ] && { echo "$id"; return; }
+              sleep 5
+            done
           }
           id=$(find_id)
           if [ -n "$id" ]; then
@@ -87,21 +91,26 @@ jobs:
               --target "${{ github.sha }}" --notes-file notes.md --generate-notes
             id=$(find_id)
           fi
+          if [ -z "$id" ]; then
+            echo "::error::下書き Release の ID を取得できませんでした"
+            exit 1
+          fi
+          echo "下書き Release: $id"
           echo "id=$id" >> "$GITHUB_OUTPUT"
 
-  # PR 用: コンパイルが通るかだけ確認
+  # コンパイルが通るかだけ確認。
+  # main でも動かして、そのキャッシュを main に保存する（PR で保存したキャッシュは他のブランチから使えないため）
   check:
     needs: prepare
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
         platform: [macos-latest, windows-latest]
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -112,6 +121,8 @@ jobs:
         with:
           workspaces: src-tauri -> target
           shared-key: check
+          # PR では読むだけ（PR ごとに数百 MB のキャッシュが増えるのを防ぐ）
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - run: npm ci
 
@@ -140,9 +151,9 @@ jobs:
             args: --bundles nsis
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -155,8 +166,17 @@ jobs:
         with:
           workspaces: src-tauri -> target
           shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - run: npm ci
+
+      - name: Check release id
+        shell: bash
+        run: |
+          if [ -z "${{ needs.prepare.outputs.release_id }}" ]; then
+            echo "::error::release_id が空です（成果物を添付できないので止めます）"
+            exit 1
+          fi
 
       - name: Build and upload to the draft release
         uses: tauri-apps/tauri-action@v0
@@ -174,4 +194,10 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "v${{ needs.prepare.outputs.version }}" --repo "${{ github.repository }}" --draft=false --latest
+        run: |
+          tag="v${{ needs.prepare.outputs.version }}"
+          assets=$(gh release view "$tag" --repo "${{ github.repository }}" --json assets -q '.assets[].name')
+          echo "$assets"
+          echo "$assets" | grep -q '\.dmg$' || { echo "::error::Mac の dmg が添付されていません"; exit 1; }
+          echo "$assets" | grep -q 'setup\.exe$' || { echo "::error::Windows の exe が添付されていません"; exit 1; }
+          gh release edit "$tag" --repo "${{ github.repository }}" --draft=false --latest
