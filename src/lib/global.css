@@ -1,0 +1,61 @@
+:root {
+  --accent: #3b82f6;
+  --blue: linear-gradient(180deg, #3b8cff, #2470ea);
+  --orange: linear-gradient(180deg, #ff9a3d, #f07a1a);
+  --green: linear-gradient(180deg, #2fbf86, #18a36e);
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+
+  /* 設定ウィンドウ（ライト） */
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --field: #ffffff;
+  --fg: #1c1f26;
+  --fg-dim: #6b7280;
+  --line: rgba(0, 0, 0, 0.08);
+  --line-strong: rgba(0, 0, 0, 0.16);
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1b1c20;
+    --surface: #24262b;
+    --field: #2c2e34;
+    --fg: #eceef2;
+    --fg-dim: #9aa0aa;
+    --line: rgba(255, 255, 255, 0.08);
+    --line-strong: rgba(255, 255, 255, 0.16);
+  }
+}
+
+/* パネル（すりガラス・常にダーク寄り） */
+:root.is-panel {
+  --glass: rgba(24, 25, 30, 0.42);
+  --glass-border: rgba(255, 255, 255, 0.14);
+  --menu: rgba(36, 38, 46, 0.97);
+  --btn: rgba(255, 255, 255, 0.08);
+  --hover: rgba(255, 255, 255, 0.1);
+  --fg: #f4f5f8;
+  --fg-dim: rgba(244, 245, 248, 0.6);
+  --line: rgba(255, 255, 255, 0.12);
+  --line-strong: rgba(255, 255, 255, 0.22);
+  color-scheme: dark;
+}
+:root.is-panel,
+:root.is-panel body {
+  background: transparent;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Segoe UI", "Yu Gothic UI", "Meiryo", sans-serif;
+  font-size: 14px;
+  background: var(--bg);
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+:root:not(.is-panel) body { overflow: auto; }
+button { font: inherit; border: 0; background: none; color: inherit; cursor: pointer; padding: 0; }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }

@@ -1,0 +1,68 @@
+# Clipo
+
+軽量なクリップボード履歴アプリ（macOS / Windows）。キーボードだけで全部の操作ができます。
+
+## ダウンロード
+
+[Releases](../../releases/latest) から入手できます。
+
+- **Mac**: `Clipo_*_universal.dmg`（Apple Silicon / Intel 両対応）
+- **Windows**: `Clipo_*_x64-setup.exe`
+
+> 署名していないため、初回起動時に警告が出ます。
+> Mac は Finder で Clipo を右クリック →「開く」、Windows は SmartScreen の「詳細情報」→「実行」で起動できます。
+
+## 主な機能
+
+- テキストと画像の履歴。コピー元のアプリを記録し、アプリ別に絞り込める
+- 画面下部のパネルにカードを並べて表示（最大3段、ページ式の横スクロール）
+- 複数選択してまとめて貼り付け（選んだ順に貼り付け）
+- タグ、お気に入り、定型文
+- 日付ごとの区切りと、期間での絞り込み
+- 範囲を選んで文字起こし（macOS: Vision / Windows: Windows.Media.Ocr）
+- テキストの翻訳（Google 翻訳はキー不要 / DeepL API にも対応）
+- 範囲スクショ。Mac 標準のスクショ（⌘⇧4 など）も自動で履歴に入る
+- パスワード管理アプリが「記録しない」と指定したコピーは保存しない
+- ショートカット、履歴の件数、段数、背景の透け具合を設定で変更できる
+
+## 初期のショートカット
+
+| 操作 | Mac | Windows |
+|---|---|---|
+| パネルを開く | ⌘⇧V | Ctrl+Alt+V |
+| 範囲を文字起こし | ⌘⇧1 | Ctrl+Shift+1 |
+| 範囲スクショ | ⌘⇧2 | （初期はオフ） |
+
+パネルの中では `⌘/`（Windows は `Ctrl+/`）を押すと、すべてのキー操作の一覧が出ます。
+
+## 必要な許可（Mac）
+
+- **アクセシビリティ**: 選んだ履歴を自動で貼り付けるため
+- **画面収録**: 文字起こしと範囲スクショのため
+
+## 開発
+
+[Tauri 2](https://tauri.app/) + Rust + Svelte 5 で作っています。
+
+```sh
+npm install
+npm run tauri dev     # 開発モードで起動
+npm run tauri build   # 配布用にビルド
+```
+
+`v*` の形のタグを push すると、GitHub Actions が Mac 版と Windows 版をビルドして Release に添付します。
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+## データの保存先
+
+- macOS: `~/Library/Application Support/com.clipo.app/`
+- Windows: `%APPDATA%\com.clipo.app\`
+
+履歴はこの PC の中だけに保存されます。外部に送るのは、翻訳ボタンを押したときのテキスト（翻訳サービス宛て）だけです。
+
+## ライセンス
+
+MIT

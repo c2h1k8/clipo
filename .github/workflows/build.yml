@@ -1,0 +1,80 @@
+name: build
+
+# - main への push / PR: Mac と Windows でビルドできるか確認（成果物は Actions に保存）
+# - v* タグの push: ビルドして GitHub Release に成果物を添付
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # Release の作成に必要
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: --target universal-apple-darwin
+          - platform: windows-latest
+            args: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+
+      - name: Type check
+        run: npm run check
+
+      - name: Build (and release on tag)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: ${{ matrix.args }}
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('Clipo {0}', github.ref_name) || '' }}
+          releaseBody: |
+            ## ダウンロード
+            - **Mac**: `Clipo_*_universal.dmg`（Apple Silicon / Intel 両対応）
+            - **Windows**: `Clipo_*_x64-setup.exe`（または `.msi`）
+
+            ### 初回起動の注意
+            このアプリは署名されていないため、初回は警告が出ます。
+            - **Mac**: dmg からアプリケーションへ移したあと、Finder で Clipo を右クリック →「開く」
+            - **Windows**: SmartScreen の「詳細情報」→「実行」
+          releaseDraft: false
+          prerelease: false
+
+      - name: Upload artifacts (non-tag builds)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: clipo-${{ matrix.platform }}
+          path: |
+            src-tauri/target/**/release/bundle/dmg/*.dmg
+            src-tauri/target/**/release/bundle/nsis/*.exe
+            src-tauri/target/**/release/bundle/msi/*.msi
+          if-no-files-found: warn
