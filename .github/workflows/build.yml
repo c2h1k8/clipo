@@ -1,8 +1,9 @@
 name: build
 
-# - PR / main への push: Mac と Windows でビルドできるか確認
+# - PR: Mac と Windows でコンパイルが通るかだけ確認（速い。配布用ビルドはしない）
 # - main への push でバージョン（tauri.conf.json）が新しくなっていたら:
-#   CI がタグ v<version> を打って下書き Release を作り、両 OS の成果物を添付してから公開する
+#   CI がタグ v<version> を打って下書き Release を作り、両 OS の配布用ビルドを添付してから公開する
+# - main への push でもバージョンが同じなら何もしない（PR で確認済み）
 # ドキュメントだけの変更ではビルドしない（バージョンを上げる変更は package.json 等を含むので必ず動く）
 on:
   push:
@@ -65,7 +66,7 @@ jobs:
           cat > notes.md <<'EOF'
           ## ダウンロード
           - **Mac**: `Clipo_*_universal.dmg`（Apple Silicon / Intel 両対応）
-          - **Windows**: `Clipo_*_x64-setup.exe`（または `.msi`）
+          - **Windows**: `Clipo_*_x64-setup.exe`
 
           ### 初回起動の注意
           このアプリは署名されていないため、初回は警告が出ます。
@@ -88,16 +89,55 @@ jobs:
           fi
           echo "id=$id" >> "$GITHUB_OUTPUT"
 
+  # PR 用: コンパイルが通るかだけ確認
+  check:
+    needs: prepare
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          shared-key: check
+
+      - run: npm ci
+
+      - name: Type check
+        run: npm run check
+
+      # tauri のビルドスクリプトはフロントの出力先（build/）があることを前提にする
+      - name: Build frontend
+        run: npm run build
+
+      - name: Cargo check
+        working-directory: src-tauri
+        run: cargo check --locked
+
+  # リリース用: 配布用ビルドを作って下書き Release に添付
   build:
     needs: prepare
+    if: needs.prepare.outputs.release == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: macos-latest
-            args: --target universal-apple-darwin
+            args: --target universal-apple-darwin --bundles app,dmg
           - platform: windows-latest
-            args: ""
+            args: --bundles nsis
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -114,30 +154,17 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
+          shared-key: release
 
       - run: npm ci
 
-      - name: Type check
-        run: npm run check
-
-      - name: Build (and upload to the draft release)
+      - name: Build and upload to the draft release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: ${{ matrix.args }}
-          releaseId: ${{ needs.prepare.outputs.release == 'true' && needs.prepare.outputs.release_id || '' }}
-
-      - name: Upload artifacts (non-release builds)
-        if: needs.prepare.outputs.release != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: clipo-${{ matrix.platform }}
-          path: |
-            src-tauri/target/**/release/bundle/dmg/*.dmg
-            src-tauri/target/**/release/bundle/nsis/*.exe
-            src-tauri/target/**/release/bundle/msi/*.msi
-          if-no-files-found: warn
+          releaseId: ${{ needs.prepare.outputs.release_id }}
 
   publish:
     needs: [prepare, build]
