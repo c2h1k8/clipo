@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, isMac, type Settings, type Tag } from "./api";
+  import { api, isMac, TAG_COLORS, type Settings, type Tag } from "./api";
   import ShortcutInput from "./ShortcutInput.svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -38,8 +38,28 @@
     savedTimer = setTimeout(() => (saved = false), 2000);
   }
 
+  let tagError = $state("");
+  let pickingColor = $state<number | null>(null);
+
   async function removeTag(t: Tag) {
     await api.deleteTag(t.id);
+    tags = await api.listTags();
+  }
+
+  async function renameTag(t: Tag, name: string) {
+    tagError = "";
+    if (!name.trim() || name.trim() === t.name) return;
+    try {
+      await api.updateTag(t.id, name, t.color);
+    } catch (err) {
+      tagError = String(err);
+    }
+    tags = await api.listTags();
+  }
+
+  async function recolor(t: Tag, color: string) {
+    await api.updateTag(t.id, t.name, color);
+    pickingColor = null;
     tags = await api.listTags();
   }
 
@@ -187,11 +207,31 @@
     <section>
       <h2>タグ</h2>
       {#if tags.length}
-        <div class="tags">
-          {#each tags as t (t.id)}
-            <span class="tag"><i style:background={t.color}></i>{t.name}<button title="削除" onclick={() => removeTag(t)}>×</button></span>
-          {/each}
-        </div>
+        {#each tags as t (t.id)}
+          <div class="row tagrow">
+            <span class="inline">
+              <button class="dotbtn" title="色を変更" onclick={() => (pickingColor = pickingColor === t.id ? null : t.id)}>
+                <i style:background={t.color}></i>
+              </button>
+              <input
+                class="text tagname"
+                value={t.name}
+                onkeydown={(e) => { if (e.key === "Enter" && !e.isComposing && e.keyCode !== 229) (e.currentTarget as HTMLInputElement).blur(); }}
+                onchange={(e) => renameTag(t, (e.currentTarget as HTMLInputElement).value)}
+              />
+            </span>
+            <button class="danger-ghost" onclick={() => removeTag(t)}>削除</button>
+          </div>
+          {#if pickingColor === t.id}
+            <div class="palette">
+              {#each TAG_COLORS as c}
+                <button class="dotbtn" class:on={t.color === c} title={c} onclick={() => recolor(t, c)}><i style:background={c}></i></button>
+              {/each}
+            </div>
+          {/if}
+        {/each}
+        {#if tagError}<p class="errors">{tagError}</p>{/if}
+        <p class="help">名前を書き換えて Enter で変更。● を押すと色を選べます。タグを削除してもカードは残ります。</p>
       {:else}
         <p class="help">タグはパネル上部の「＋」から追加できます。</p>
       {/if}
@@ -244,11 +284,13 @@
   }
   .notice p { margin: 4px 0 0; font-size: 12px; line-height: 1.5; color: var(--fg-dim); }
   .notice button { flex: none; }
-  .tags { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 0; }
-  .tag { display: inline-flex; align-items: center; gap: 6px; padding: 3px 4px 3px 10px; border-radius: 999px; background: var(--field); border: 1px solid var(--line); font-size: 12.5px; }
-  .tag i { width: 8px; height: 8px; border-radius: 50%; }
-  .tag button { height: 20px; width: 20px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--fg-dim); }
-  .tag button:hover { background: var(--line); color: var(--fg); }
+  .tagrow .inline { align-items: center; }
+  .tagname { width: 220px !important; }
+  .dotbtn { width: 28px; height: 28px; padding: 0; display: grid; place-items: center; border-radius: 50%; }
+  .dotbtn i { width: 14px; height: 14px; border-radius: 50%; display: block; }
+  .dotbtn.on { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
+  .palette { display: flex; gap: 6px; padding: 0 0 8px 34px; }
+  .danger-ghost { color: #dc2626; }
   footer {
     position: fixed; left: 0; right: 0; bottom: 0;
     display: flex; align-items: center; justify-content: flex-end; gap: 12px;

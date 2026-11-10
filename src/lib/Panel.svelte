@@ -30,8 +30,11 @@
   let toast = $state<{ text: string; action?: { label: string; run: () => void } } | null>(null);
   let addingTag = $state(false);
   let newTagName = $state("");
+  /** 名前を変更中のタグ */
+  let renaming = $state<{ id: number; name: string } | null>(null);
+  let renameInput = $state<HTMLInputElement | null>(null);
   /** 開いているメニュー（右クリック/コピー元/タグ） */
-  let menu = $state<{ kind: "card" | "app" | "tag" | "tagpill" | "date"; x: number; y: number; itemId?: number; tagId?: number } | null>(null);
+  let menu = $state<{ kind: "card" | "app" | "tag" | "tagpill" | "tagedit" | "date"; x: number; y: number; itemId?: number; tagId?: number } | null>(null);
   let menuRef = $state<Menu | null>(null);
   let help = $state(false);
   let appBtn: HTMLButtonElement;
@@ -411,6 +414,17 @@
       })),
       ...(tags.length ? [{ kind: "sep" } as MenuEntry] : []),
       { label: "新しいタグを作成して付ける…", icon: "plus", run: () => startNewTag(item) },
+      ...(tags.length
+        ? [{
+            label: "タグの名前・色を編集…",
+            icon: "edit",
+            keepOpen: true,
+            run: () => {
+              const m = menu;
+              if (m) menu = { kind: "tagedit", x: m.x, y: m.y };
+            },
+          } as MenuEntry]
+        : []),
     ];
   }
 
@@ -437,11 +451,24 @@
         run: () => setDateRange(r),
       }));
     }
+    if (menu.kind === "tagedit") {
+      // 編集するタグを選ぶ
+      return tags.map((t): MenuEntry => ({
+        label: t.name,
+        dot: t.color,
+        keepOpen: true,
+        run: () => {
+          const m = menu;
+          if (m) menu = { kind: "tagpill", tagId: t.id, x: m.x, y: m.y };
+        },
+      }));
+    }
     if (menu.kind === "tagpill") {
       const t = tags.find((x) => x.id === menu!.tagId);
       if (!t) return [];
       return [
-        { label: `「${t.name}」で絞り込む`, dot: t.color, run: () => setTab({ kind: "tag", id: t.id }) },
+        { label: "名前を変更…", icon: "edit", run: () => startRename(t) },
+        { kind: "swatches", label: "色", colors: TAG_COLORS, value: t.color, onpick: (c) => recolorTag(t, c) },
         { kind: "sep" },
         { label: "このタグを削除（カードは残ります）", icon: "trash", danger: true, run: () => deleteTag(t) },
       ];
@@ -479,6 +506,49 @@
     list.push({ kind: "sep" }, { label: `削除${n}`, icon: "trash", hint: `${MOD}${K.del}`, danger: true, run: () => remove() });
     return list;
   });
+
+  async function startRename(t: Tag) {
+    menu = null;
+    renaming = { id: t.id, name: t.name };
+    await tick();
+    renameInput?.focus();
+    renameInput?.select();
+  }
+
+  async function commitRename() {
+    const r = renaming;
+    renaming = null;
+    const t = r && tags.find((x) => x.id === r.id);
+    if (!r || !t || !r.name.trim() || r.name.trim() === t.name) return;
+    try {
+      await api.updateTag(t.id, r.name, t.color);
+      showToast(`タグ名を「${r.name.trim()}」に変更しました`);
+    } catch (err) {
+      showToast(String(err));
+    }
+    await reload();
+  }
+
+  async function recolorTag(t: Tag, color: string) {
+    await api.updateTag(t.id, t.name, color);
+    await reload();
+  }
+
+  /** 選択中のタグタブのメニュー（キーボード用） */
+  function openTagPillMenu() {
+    if (tab.kind !== "tag") {
+      if (!tags.length) {
+        showToast("タグがまだありません（＋ または " + MOD + "G から作成）", undefined, 2500);
+        return;
+      }
+      const p = focusedCardPos();
+      menu = { kind: "tagedit", ...placeMenu(p.x, p.y, 200) };
+      return;
+    }
+    const el = document.querySelector<HTMLElement>(`[data-tag="${tab.id}"]`);
+    const r = el?.getBoundingClientRect();
+    menu = { kind: "tagpill", tagId: tab.id, ...placeMenu(r?.left ?? 40, (r?.bottom ?? 40) + 6, 260) };
+  }
 
   async function deleteTag(t: Tag) {
     await api.deleteTag(t.id);
@@ -548,7 +618,7 @@
       else if (mod && e.key === "Enter") saveEditor();
       return;
     }
-    if (addingTag) return;
+    if (addingTag || renaming) return;
     if (help) {
       if (e.key === "Escape" || (mod && e.key === "/") || e.key === "?") { e.preventDefault(); help = false; }
       return;
@@ -661,6 +731,9 @@
         const it = items[focusIdx];
         if (it?.translated) revert(it);
         else if (it) runAction(it);
+      } else if (k === "k" && e.shiftKey) {
+        e.preventDefault();
+        openTagPillMenu();
       } else if (k === "k") {
         e.preventDefault();
         openCardMenu();
@@ -731,7 +804,7 @@
 
   /** 日本語入力が 1 文字目から正しく効くよう、検索欄に常にカーソルを置いておく */
   function keepSearchFocus() {
-    if (!editor && !addingTag) searchEl?.focus({ preventScroll: true });
+    if (!editor && !addingTag && !renaming) searchEl?.focus({ preventScroll: true });
   }
 
   function onPanelMouseDown(e: MouseEvent) {
@@ -754,7 +827,7 @@
 
   // 編集画面やタグ入力を閉じたら検索欄にカーソルを戻す
   $effect(() => {
-    if (!editor && !addingTag && !help) tick().then(keepSearchFocus);
+    if (!editor && !addingTag && !renaming && !help) tick().then(keepSearchFocus);
   });
 
   async function applySettings() {
@@ -851,13 +924,33 @@
       </button>
       <button class="pill" class:on={tab.kind === "snippet"} onclick={() => setTab({ kind: "snippet" })}>定型文</button>
       {#each tags as t (t.id)}
+        {#if renaming?.id === t.id}
+          <input
+            class="taginput"
+            bind:this={renameInput}
+            bind:value={renaming.name}
+            onkeydown={(e) => {
+              if (isImeKey(e)) return;
+              if (e.key === "Enter" || e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation();
+                if (e.key === "Enter") commitRename();
+                else renaming = null;
+              }
+            }}
+            onblur={() => { if (renaming) renaming = null; }}
+          />
+        {:else}
         <button
+          data-tag={t.id}
           class="pill"
           class:on={tab.kind === "tag" && tab.id === t.id}
           onclick={() => setTab({ kind: "tag", id: t.id })}
           oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); menu = { kind: "tagpill", tagId: t.id, ...placeMenu(e.clientX, e.clientY, 100) }; }}
-          title="右クリックで削除"
+          ondblclick={() => startRename(t)}
+          title="右クリック: 名前・色の変更、削除（{MOD}{K.shift}K） / ダブルクリック: 名前を変更"
         ><i style:background={t.color}></i>{t.name}</button>
+        {/if}
       {/each}
       {#if addingTag}
         <!-- svelte-ignore a11y_autofocus -->
@@ -1016,6 +1109,7 @@
             <dt>{MOD}[ / {MOD}]</dt><dd>前の日 / 次の日の先頭へ</dd>
             <dt>{MOD}K</dt><dd>メニュー（↑↓ {K.enter}）</dd>
             <dt>{MOD}G</dt><dd>タグを付ける / 外す・新規作成</dd>
+            <dt>{MOD}{K.shift}K</dt><dd>タグの名前・色の変更、削除（{MOD}G のメニューからも）</dd>
             <dt>{MOD}D</dt><dd>お気に入り</dd>
             <dt>{MOD}T</dt><dd>翻訳 / 元に戻す・画像は文字起こし</dd>
             <dt>{MOD}E / {MOD}N</dt><dd>定型文にする / 新しい定型文</dd>

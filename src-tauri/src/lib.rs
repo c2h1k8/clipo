@@ -549,8 +549,30 @@ fn create_tag(state: State<AppState>, name: String, color: String) -> Res<Tag> {
 }
 
 #[tauri::command]
-fn delete_tag(state: State<AppState>, id: i64) -> Res<()> {
-    state.db.lock().unwrap().delete_tag(id).map_err(e)
+fn update_tag(app: AppHandle, state: State<AppState>, id: i64, name: String, color: String) -> Res<()> {
+    if name.trim().is_empty() {
+        return Err("タグ名が空です".into());
+    }
+    state
+        .db
+        .lock()
+        .unwrap()
+        .update_tag(id, &name, &color)
+        .map_err(|err| match err {
+            rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation => {
+                format!("「{}」という名前のタグはすでにあります", name.trim())
+            }
+            other => other.to_string(),
+        })?;
+    let _ = app.emit("clips-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_tag(app: AppHandle, state: State<AppState>, id: i64) -> Res<()> {
+    state.db.lock().unwrap().delete_tag(id).map_err(e)?;
+    let _ = app.emit("clips-changed", ());
+    Ok(())
 }
 
 #[tauri::command]
@@ -908,6 +930,7 @@ pub fn run() {
             list_tags,
             create_tag,
             delete_tag,
+            update_tag,
             toggle_tag,
             set_tag,
             set_favorite,

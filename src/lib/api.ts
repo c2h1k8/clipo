@@ -60,6 +60,7 @@ export const api = {
   sourceApps: () => invoke<SourceApp[]>("source_apps"),
   listTags: () => invoke<Tag[]>("list_tags"),
   createTag: (name: string, color: string) => invoke<Tag>("create_tag", { name, color }),
+  updateTag: (id: number, name: string, color: string) => invoke<void>("update_tag", { id, name, color }),
   deleteTag: (id: number) => invoke<void>("delete_tag", { id }),
   setTag: (itemIds: number[], tagId: number, on: boolean) => invoke<void>("set_tag", { itemIds, tagId, on }),
   toggleTag: (itemId: number, tagId: number) => invoke<boolean>("toggle_tag", { itemId, tagId }),

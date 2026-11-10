@@ -360,6 +360,15 @@ impl Db {
         )
     }
 
+    /// 名前・色を変更。同じ名前のタグが既にあればエラー
+    pub fn update_tag(&self, id: i64, name: &str, color: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE tags SET name = ?1, color = ?2 WHERE id = ?3",
+            params![name.trim(), color, id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_tag(&self, id: i64) -> rusqlite::Result<()> {
         self.conn.execute("DELETE FROM tags WHERE id = ?1", [id])?;
         Ok(())

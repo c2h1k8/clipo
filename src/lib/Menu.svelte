@@ -15,7 +15,9 @@
         keepOpen?: boolean;
         run: () => void | Promise<void>;
       }
-    | { kind: "sep"; label?: string };
+    | { kind: "sep"; label?: string }
+    /** 1 行に並べる色見本。←→ で選んで Enter */
+    | { kind: "swatches"; label: string; colors: string[]; value: string; onpick: (c: string) => void | Promise<void> };
 </script>
 
 <script lang="ts">
@@ -31,6 +33,13 @@
   }: { entries: MenuEntry[]; x: number; y: number; width?: number; onclose: () => void } = $props();
 
   let active = $state(0);
+  /** 色見本の行で選んでいる色 */
+  let swatch = $state(0);
+  // 色見本の行に来たら、いまの色から選び始める
+  $effect(() => {
+    const cur = entries[active];
+    if (cur?.kind === "swatches") swatch = Math.max(0, cur.colors.indexOf(cur.value));
+  });
   let el: HTMLDivElement;
   // 実際の大きさを測って、ウィンドウからはみ出さない位置に置く
   let pos = $state({ left: 0, top: 0 });
@@ -61,6 +70,10 @@
   async function run(i: number) {
     const e = entries[i];
     if (!e || e.kind === "sep") return;
+    if (e.kind === "swatches") {
+      await e.onpick(e.colors[swatch]);
+      return;
+    }
     await e.run();
     if (!e.keepOpen) onclose();
   }
@@ -68,6 +81,13 @@
   /** パネル側のキー処理から呼ぶ。処理したら true */
   export function handleKey(e: KeyboardEvent): boolean {
     const pos = runnable.indexOf(active);
+    const cur = entries[active];
+    if (cur?.kind === "swatches" && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+      const n = cur.colors.length;
+      swatch = (swatch + (e.key === "ArrowRight" ? 1 : -1) + n) % n;
+      e.preventDefault();
+      return true;
+    }
     switch (e.key) {
       case "ArrowDown":
         active = runnable[(pos + 1) % runnable.length];
@@ -128,6 +148,28 @@
   {#each entries as e, i}
     {#if e.kind === "sep"}
       <div class="sep">{e.label ?? ""}</div>
+    {:else if e.kind === "swatches"}
+      <div
+        class="swatches"
+        class:active={i === active}
+        data-i={i}
+        role="menuitem"
+        tabindex="-1"
+        onmouseenter={() => (active = i)}
+      >
+        <span class="label">{e.label}</span>
+        {#each e.colors as c, n}
+          <button
+            class="sw"
+            class:cur={c === e.value}
+            class:kbd={i === active && n === swatch}
+            style:background={c}
+            title={c}
+            aria-label={c}
+            onclick={() => { swatch = n; e.onpick(c); }}
+          ></button>
+        {/each}
+      </div>
     {:else}
       <button
         data-i={i}
@@ -172,6 +214,20 @@
   .tick { width: 12px; font-size: 11px; }
   i { width: 8px; height: 8px; border-radius: 50%; flex: none; }
   img { width: 16px; height: 16px; flex: none; }
+  .swatches {
+    display: flex; align-items: center; gap: 6px;
+    padding: 5px 8px; border-radius: 6px; font-size: 12.5px; color: var(--fg);
+  }
+  .swatches.active { background: var(--hover, rgba(255, 255, 255, 0.08)); }
+  .swatches .label { flex: none; margin-right: 2px; }
+  .sw {
+    width: 16px; height: 16px; padding: 0; flex: none;
+    border-radius: 50%;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.25);
+  }
+  .sw.cur { box-shadow: 0 0 0 2px var(--menu), 0 0 0 4px #fff; }
+  .sw.kbd { transform: scale(1.25); }
+  .sw:hover { transform: scale(1.2); }
   .sep { margin: 3px 8px 1px; padding-top: 3px; border-top: 1px solid var(--line); font-size: 10.5px; color: var(--fg-dim); }
   .sep:empty { padding-top: 0; margin: 4px 8px; }
 </style>

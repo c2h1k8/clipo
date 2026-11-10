@@ -50,11 +50,20 @@ npm run tauri dev     # 開発モードで起動
 npm run tauri build   # 配布用にビルド
 ```
 
-`v*` の形のタグを push すると、GitHub Actions が Mac 版と Windows 版をビルドして Release に添付します。
+### リリースの手順
+
+バージョンを上げた PR を main にマージすると、GitHub Actions がタグ `v<バージョン>` を打ち、
+Mac 版と Windows 版をビルドして Release を公開します（両方のビルドが成功したときだけ公開）。
 
 ```sh
-git tag v0.1.0 && git push origin v0.1.0
+npm run bump minor        # 0.1.0 → 0.2.0（patch / major / 0.2.0 のような指定も可）
+git switch -c release/v0.2.0
+git commit -am "Release v0.2.0"
+gh pr create --fill       # マージするとリリースされる
 ```
+
+- バージョンを上げていない PR では、ビルドできるかの確認だけ行います
+- README などドキュメントだけの変更では、ビルドも動きません
 
 ## データの保存先
 
