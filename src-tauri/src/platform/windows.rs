@@ -192,10 +192,15 @@ pub fn save_app_icon(app: &AppInfo, out: &Path) -> bool {
 }
 
 /// パネルのウィンドウを Windows 11 風にする（すりガラス＋角丸）
-pub fn style_panel(win: &tauri::WebviewWindow) {
+/// blur=false ならすりガラスを外して、後ろの画面がそのまま透けるようにする
+pub fn style_panel(win: &tauri::WebviewWindow, blur: bool) {
     use tauri::window::{Effect, EffectState, EffectsBuilder};
     use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
-    let _ = win.set_effects(EffectsBuilder::new().effect(Effect::Acrylic).state(EffectState::Active).build());
+    if blur {
+        let _ = win.set_effects(EffectsBuilder::new().effect(Effect::Acrylic).state(EffectState::Active).build());
+    } else {
+        let _ = win.set_effects(None);
+    }
     if let Ok(hwnd) = win.hwnd() {
         let pref = DWMWCP_ROUND;
         unsafe {
@@ -348,6 +353,8 @@ pub fn screenshot_prefixes() -> Vec<String> {
 }
 
 /// 修飾キーの 2 回押し検出用に、キーボードの低レベルフックを専用スレッドで動かす
+static CTRL_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn start_modifier_watch() {
     use crate::taps::{self, Mod};
     use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
@@ -372,10 +379,19 @@ pub fn start_modifier_watch() {
                     let msg = wparam.0 as u32;
                     let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
                     let is_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+                    if m == Some(Mod::Control) {
+                        CTRL_DOWN.store(is_down, std::sync::atomic::Ordering::SeqCst);
+                    }
                     match (m, is_down, is_up) {
                         (Some(m), true, _) => taps::down(m),
                         (Some(m), _, true) => taps::up(m),
-                        (None, true, _) => taps::other(),
+                        (None, true, _) => {
+                            taps::other();
+                            // Ctrl+V（VK_V = 0x56）
+                            if k.vkCode == 0x56 && CTRL_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                                taps::paste_key();
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -393,4 +409,108 @@ pub fn start_modifier_watch() {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
     });
+}
+
+const CF_UNICODETEXT: u32 = 13;
+const CF_HDROP: u32 = 15;
+
+/// 他のアプリが使用中のことがあるので少し待ってやり直す
+fn open_clipboard() -> bool {
+    use windows::Win32::System::DataExchange::OpenClipboard;
+    for _ in 0..10 {
+        if unsafe { OpenClipboard(None) }.is_ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    false
+}
+
+/// クリップボードのファイル（エクスプローラーでコピーしたもの）のパス
+pub fn read_files() -> Option<Vec<String>> {
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData};
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+    unsafe {
+        if IsClipboardFormatAvailable(CF_HDROP).is_err() || !open_clipboard() {
+            return None;
+        }
+        let out = GetClipboardData(CF_HDROP).ok().map(|h| {
+            let hdrop = HDROP(h.0);
+            let n = DragQueryFileW(hdrop, u32::MAX, None);
+            (0..n)
+                .map(|i| {
+                    let len = DragQueryFileW(hdrop, i, None) as usize;
+                    let mut buf = vec![0u16; len + 1];
+                    DragQueryFileW(hdrop, i, Some(&mut buf));
+                    String::from_utf16_lossy(&buf[..len])
+                })
+                .collect::<Vec<_>>()
+        });
+        let _ = CloseClipboard();
+        out.filter(|v| !v.is_empty())
+    }
+}
+
+/// u16 列をグローバルメモリに入れてクリップボードへ
+unsafe fn set_global(format: u32, header: &[u8], body: &[u16]) -> Result<(), String> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::DataExchange::SetClipboardData;
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    unsafe {
+        let size = header.len() + body.len() * 2;
+        let h = GlobalAlloc(GMEM_MOVEABLE, size).map_err(|e| e.to_string())?;
+        let p = GlobalLock(h) as *mut u8;
+        if p.is_null() {
+            return Err("メモリを確保できませんでした".into());
+        }
+        std::ptr::copy_nonoverlapping(header.as_ptr(), p, header.len());
+        std::ptr::copy_nonoverlapping(body.as_ptr() as *const u8, p.add(header.len()), body.len() * 2);
+        let _ = GlobalUnlock(h);
+        SetClipboardData(format, Some(HANDLE(h.0))).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// ファイルをクリップボードへ（エクスプローラーでコピーしたのと同じ形）。
+/// 文字を貼るアプリ向けにファイル名も一緒に入れる
+pub fn write_files(paths: &[String]) -> Result<(), String> {
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard};
+    use windows::Win32::UI::Shell::DROPFILES;
+    // DROPFILES の後ろに「パス\0パス\0\0」(UTF-16)
+    let mut list: Vec<u16> = vec![];
+    for p in paths {
+        list.extend(p.encode_utf16());
+        list.push(0);
+    }
+    list.push(0);
+    let df = DROPFILES {
+        pFiles: std::mem::size_of::<DROPFILES>() as u32,
+        fWide: true.into(),
+        ..Default::default()
+    };
+    let header = unsafe {
+        std::slice::from_raw_parts(&df as *const DROPFILES as *const u8, std::mem::size_of::<DROPFILES>())
+    };
+    let names: Vec<String> = paths
+        .iter()
+        .map(|p| Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.clone()))
+        .collect();
+    let mut text: Vec<u16> = names.join("\r\n").encode_utf16().collect();
+    text.push(0);
+    if !open_clipboard() {
+        return Err("クリップボードを開けませんでした".into());
+    }
+    let r = unsafe {
+        EmptyClipboard()
+            .map_err(|e| e.to_string())
+            .and_then(|_| set_global(CF_HDROP, header, &list))
+            .and_then(|_| set_global(CF_UNICODETEXT, &[], &text))
+    };
+    let _ = unsafe { CloseClipboard() };
+    r
+}
+
+/// ファイルのアイコン（未対応。カードは汎用のファイルアイコンになる）
+pub fn save_file_icon(_path: &str, _out: &Path) -> bool {
+    false
 }

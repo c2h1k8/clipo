@@ -3,6 +3,8 @@
   --blue: linear-gradient(180deg, #3b8cff, #2470ea);
   --orange: linear-gradient(180deg, #ff9a3d, #f07a1a);
   --green: linear-gradient(180deg, #2fbf86, #18a36e);
+  --cyan: linear-gradient(180deg, #22b8d6, #0e9ab8);
+  --purple: linear-gradient(180deg, #9b7bff, #7a55f0);
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
 
   /* 設定ウィンドウ（ライト） */

@@ -104,6 +104,20 @@ pub fn up(m: Mod) {
     }
 }
 
+static PASTE: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// ⌘V / Ctrl+V が押されたときの処理を登録（最初の 1 回だけ）
+pub fn on_paste(handler: impl Fn() + Send + Sync + 'static) {
+    let _ = PASTE.set(Box::new(handler));
+}
+
+/// ユーザーが ⌘V / Ctrl+V を押した（「続けて貼る」用）
+pub fn paste_key() {
+    if let Some(h) = PASTE.get() {
+        h();
+    }
+}
+
 /// 修飾キー以外のキーが押された
 pub fn other() {
     with(|s| {

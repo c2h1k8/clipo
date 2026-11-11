@@ -19,7 +19,7 @@ pub struct Settings {
     pub deepl_api_key: String,
     /// 訳先の言語（"ja" のとき日本語の文は英語へ訳す）
     pub translate_target: String,
-    /// 履歴の最大件数（お気に入り・定型文は数えない）
+    /// 履歴の最大件数（保存したものは数えない）
     pub max_history: u32,
     /// パネルのカードの段数（1〜3）
     pub panel_rows: u32,
@@ -27,6 +27,12 @@ pub struct Settings {
     pub group_by_date: bool,
     /// パネル背景の不透明度（0〜100）
     pub panel_opacity: u32,
+    /// 背景をすりガラス（OS のぼかし効果）にする。オフなら後ろがそのまま透ける
+    pub panel_blur: bool,
+    /// カードの大きさ: "small" | "medium" | "large"
+    pub card_size: String,
+    /// 記録しないアプリ（macOS: bundle id / Windows: exe 名）
+    pub excluded_apps: Vec<String>,
     /// 複数選択して貼り付けるときの区切り文字
     pub multi_separator: String,
     /// ログイン時に起動
@@ -52,7 +58,10 @@ impl Default for Settings {
             max_history: 500,
             panel_rows: 1,
             panel_opacity: 30,
+            panel_blur: true,
             group_by_date: true,
+            card_size: "medium".into(),
+            excluded_apps: vec![],
             multi_separator: "\n".into(),
             launch_at_login: false,
         }
@@ -78,6 +87,9 @@ impl Settings {
         self.max_history = self.max_history.clamp(10, 10_000);
         self.panel_rows = self.panel_rows.clamp(1, 3);
         self.panel_opacity = self.panel_opacity.min(100);
+        if !matches!(self.card_size.as_str(), "small" | "medium" | "large") {
+            self.card_size = "medium".into();
+        }
         self
     }
 }

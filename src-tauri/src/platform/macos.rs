@@ -247,8 +247,13 @@ pub fn screenshot_prefixes() -> Vec<String> {
 }
 
 /// パネルのウィンドウをすりガラスにする
-pub fn style_panel(win: &tauri::WebviewWindow) {
+/// blur=false ならすりガラスを外して、後ろの画面がそのまま透けるようにする
+pub fn style_panel(win: &tauri::WebviewWindow, blur: bool) {
     use tauri::window::{Effect, EffectState, EffectsBuilder};
+    if !blur {
+        let _ = win.set_effects(None);
+        return;
+    }
     let _ = win.set_effects(
         EffectsBuilder::new()
             .effect(Effect::HudWindow)
@@ -270,6 +275,14 @@ pub fn start_modifier_watch() {
         let kind = ev.r#type();
         if kind == NSEventType::KeyDown {
             taps::other();
+            // ⌘V（kVK_ANSI_V = 9）。他の修飾キーが付いていないもの
+            let flags = ev.modifierFlags();
+            if ev.keyCode() == 9
+                && flags.contains(NSEventModifierFlags::Command)
+                && !flags.intersects(NSEventModifierFlags::Shift | NSEventModifierFlags::Option | NSEventModifierFlags::Control)
+            {
+                taps::paste_key();
+            }
             return;
         }
         if kind != NSEventType::FlagsChanged {
@@ -294,4 +307,57 @@ pub fn start_modifier_watch() {
     // 監視は終了まで続けるので、返り値のオブジェクトは解放しない
     std::mem::forget(NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &global));
     std::mem::forget(unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &local) });
+}
+
+/// クリップボードのファイル（Finder でコピーしたもの）のパス
+pub fn read_files() -> Option<Vec<String>> {
+    use objc2_foundation::NSURL;
+    unsafe {
+        let pb = NSPasteboard::generalPasteboard();
+        let items = pb.pasteboardItems()?;
+        let ty = NSString::from_str("public.file-url");
+        let out: Vec<String> = items
+            .iter()
+            .filter_map(|it| it.stringForType(&ty))
+            .filter_map(|s| NSURL::URLWithString(&s))
+            .filter_map(|u| u.path())
+            .map(|p| p.to_string())
+            .collect();
+        (!out.is_empty()).then_some(out)
+    }
+}
+
+/// ファイルをクリップボードへ（Finder で ⌘C したのと同じ形）。
+/// 文字を貼るアプリ向けにファイル名も一緒に入れる
+pub fn write_files(paths: &[String]) -> Result<(), String> {
+    use objc2::runtime::ProtocolObject;
+    use objc2_app_kit::{NSPasteboardItem, NSPasteboardWriting};
+    use objc2_foundation::{NSArray, NSURL};
+    unsafe {
+        let pb = NSPasteboard::generalPasteboard();
+        let url_ty = NSString::from_str("public.file-url");
+        let txt_ty = NSString::from_str("public.utf8-plain-text");
+        let mut objs: Vec<objc2::rc::Retained<ProtocolObject<dyn NSPasteboardWriting>>> = vec![];
+        for p in paths {
+            let url = NSURL::fileURLWithPath(&NSString::from_str(p));
+            let item = NSPasteboardItem::new();
+            if let Some(abs) = url.absoluteString() {
+                item.setString_forType(&abs, &url_ty);
+            }
+            let name = Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.clone());
+            item.setString_forType(&NSString::from_str(&name), &txt_ty);
+            objs.push(ProtocolObject::from_retained(item));
+        }
+        pb.clearContents();
+        if pb.writeObjects(&NSArray::from_retained_slice(&objs)) {
+            Ok(())
+        } else {
+            Err("ファイルをクリップボードに入れられませんでした".into())
+        }
+    }
+}
+
+/// ファイルのアイコン（Finder と同じ）を PNG で保存
+pub fn save_file_icon(path: &str, out: &Path) -> bool {
+    save_app_icon(&AppInfo { id: String::new(), name: String::new(), path: Some(path.into()), pid: 0 }, out)
 }

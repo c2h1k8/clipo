@@ -2,8 +2,9 @@
   import { onMount, tick } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import {
-    api, fileSrc, isMac, TAG_COLORS, DATE_RANGE_LABEL, dateRangeBounds, dayKey, dayLabel,
-    type DateRange, type Item, type SourceApp, type Tab, type Tag,
+    api, fileSrc, fileNames, isLink, isMac, TAG_COLORS, PLACEHOLDERS, DATE_RANGE_LABEL, dateRangeBounds, dayKey, dayLabel,
+    CARD_SIZES, KIND_LABEL, KIND_ICON, TRANSFORMS,
+    type CardSize, type DateRange, type Item, type KindFilter, type SourceApp, type Tab, type Tag,
   } from "./api";
   import Card from "./Card.svelte";
   import Icon from "./Icon.svelte";
@@ -17,7 +18,7 @@
   let items = $state<Item[]>([]);
   let tags = $state<Tag[]>([]);
   let apps = $state<SourceApp[]>([]);
-  let tab = $state<Tab>({ kind: "all" });
+  let tab = $state<Tab>({ kind: "history" });
   let sourceId = $state<string | null>(null);
   let query = $state("");
   let dateRange = $state<DateRange>("all");
@@ -34,13 +35,24 @@
   let renaming = $state<{ id: number; name: string } | null>(null);
   let renameInput = $state<HTMLInputElement | null>(null);
   /** 開いているメニュー（右クリック/コピー元/タグ） */
-  let menu = $state<{ kind: "card" | "app" | "tag" | "tagpill" | "tagedit" | "date"; x: number; y: number; itemId?: number; tagId?: number } | null>(null);
+  let menu = $state<{ kind: "card" | "app" | "tag" | "tagpill" | "tagedit" | "date" | "moretags" | "kind" | "transform"; x: number; y: number; itemId?: number; tagId?: number } | null>(null);
   let menuRef = $state<Menu | null>(null);
   let help = $state(false);
+  /** 種類の絞り込み */
+  let kindFilter = $state<KindFilter | null>(null);
+  let kindBtn = $state<HTMLButtonElement | null>(null);
+  let cardSize = $state<CardSize>("medium");
+  /** 記録を一時停止中 */
+  let paused = $state(false);
+  /** Space で大きく表示 */
+  let preview = $state(false);
+  let previewText = $state<string | null>(null);
   let appBtn: HTMLButtonElement;
-  let dateBtn: HTMLButtonElement;
+  let dateBtn = $state<HTMLButtonElement | null>(null);
   let tagInput = $state<HTMLInputElement | null>(null);
-  let editor = $state<{ id: number | null; title: string; text: string } | null>(null);
+  /** 保存の編集。text が null なら画像（タイトルと短い名前だけ） */
+  let editor = $state<{ id: number | null; title: string; keyword: string; text: string | null } | null>(null);
+  let editorText = $state<HTMLTextAreaElement | null>(null);
   let screenshotEnabled = $state(true);
   /** 設定の最大段数 */
   let maxRows = $state(1);
@@ -48,12 +60,14 @@
   let rows = $state(1);
   let panelWidth = $state(typeof window !== "undefined" ? window.innerWidth : 1200);
   // レイアウト計算（CSS と同じ値）
-  const CARD_W = 236, CARD_H = 204, GAP = 12, PAD_X = 32;
+  const GAP = 12, PAD_X = 32;
+  const CARD_W = $derived(CARD_SIZES[cardSize].w);
+  const CARD_H = $derived(CARD_SIZES[cardSize].h);
   /** バー 48 + ヒント 26 + 一覧の上下余白 22 */
   const CHROME_H = 96;
-  const showDays = $derived(groupByDate && tab.kind !== "snippet");
-  /** 定型文タブでは先頭に「新しい定型文」カードが入る */
-  const lead = $derived(tab.kind === "snippet" ? 1 : 0);
+  const showDays = $derived(groupByDate && tab.kind === "history");
+  /** 保存タブでは先頭に「新しく保存」カードが入る */
+  const lead = $derived(tab.kind === "saved" ? 1 : 0);
   /**
    * 1段: 横に 1 列。
    * 多段: 「列数×段数」を 1 ページとし、ページ内は左上から右へ並べて折り返す。ページは横に並ぶ。
@@ -66,7 +80,7 @@
     return { rows: r, cols, perPage: r * cols, height: CHROME_H + r * CARD_H + (r - 1) * GAP };
   });
   const paged = $derived(layout.rows > 1);
-  /** ページごとのセル（-1 は「新しい定型文」カード） */
+  /** ページごとのセル（-1 は「新しく保存」カード） */
   const pages = $derived.by(() => {
     const cells = [...(lead ? [-1] : []), ...items.map((_, i) => i)];
     const out: number[][] = [];
@@ -94,7 +108,7 @@
   }
 
   async function reload(keepSelection = true) {
-    const [it, tg, ap] = await Promise.all([api.listItems(tab, sourceId, query, dateRangeBounds(dateRange)), api.listTags(), api.sourceApps()]);
+    const [it, tg, ap] = await Promise.all([api.listItems(tab, sourceId, query, dateRangeBounds(dateRange), kindFilter), api.listTags(), api.sourceApps()]);
     items = it;
     tags = tg;
     apps = ap;
@@ -256,18 +270,30 @@
     return items[focusIdx] ? [items[focusIdx].id] : [];
   }
 
-  async function paste(ids = targetIds(), copyOnly = false) {
+  async function paste(ids = targetIds(), copyOnly = false, asPath = false, transform: string | null = null) {
     if (!ids.length) return;
     menu = null;
-    await api.paste(ids, copyOnly);
+    preview = false;
+    try {
+      await api.paste(ids, copyOnly, asPath, transform);
+    } catch (err) {
+      showToast(String(err), undefined, 5000);
+    }
   }
 
-  async function toggleFavorite(ids = targetIds()) {
+  /** 保存する / 保存を外す。どちらもカードは今のタブから別のタブへ移る */
+  async function toggleSaved(ids = targetIds()) {
     const list = items.filter((i) => ids.includes(i.id));
-    const fav = !list.every((i) => i.favorite);
-    for (const i of list) await api.setFavorite(i.id, fav);
+    if (!list.length) return;
+    const on = !list.every((i) => i.saved);
+    await api.setSaved(list.map((i) => i.id), on);
     menu = null;
-    reload();
+    const n = list.length > 1 ? `${list.length}件を` : "";
+    showToast(on ? `${n}保存しました` : `${n}保存から外して履歴に戻しました`, {
+      label: on ? "保存を開く" : "履歴を開く",
+      run: () => setTab(on ? { kind: "saved", tag: null } : { kind: "history" }),
+    });
+    await reload();
   }
 
   async function remove(ids = targetIds()) {
@@ -280,7 +306,11 @@
   }
 
   async function runAction(item: Item) {
-    if (busy[item.id]) return;
+    if (busy[item.id] || item.kind === "file") return;
+    if (item.kind === "text" && !item.translated && isLink(item.preview)) {
+      await openLink(item);
+      return;
+    }
     busy[item.id] = true;
     try {
       if (item.kind === "image") {
@@ -320,7 +350,7 @@
     const t = existing ?? (await api.createTag(name, TAG_COLORS[tags.length % TAG_COLORS.length]));
     if (targets.length) {
       await api.setTag(targets, t.id, true);
-      showToast(`${targets.length > 1 ? `${targets.length}件に` : ""}タグ「${t.name}」を付けました`);
+      showToast(`${targets.length > 1 ? `${targets.length}件に` : ""}タグ「${t.name}」を付けて保存しました`);
     } else {
       showToast(existing ? `タグ「${t.name}」はすでにあります` : `タグ「${t.name}」を作成しました`);
     }
@@ -334,7 +364,8 @@
     const on = !targets.every((i) => i.tags.includes(tagId));
     await api.setTag(ids, tagId, on);
     const name = tags.find((t) => t.id === tagId)?.name ?? "";
-    showToast(on ? `「${name}」を付けました` : `「${name}」を外しました`, undefined, 1800);
+    const saving = on && targets.some((i) => !i.saved);
+    showToast(on ? `「${name}」を付けました${saving ? "（保存に入りました）" : ""}` : `「${name}」を外しました`, undefined, 1800);
     await reload();
   }
 
@@ -378,8 +409,53 @@
   }
 
   function openDateMenu() {
+    // 期間の絞り込みは履歴だけ
+    if (!dateBtn || tab.kind !== "history") return;
     const r = dateBtn.getBoundingClientRect();
     menu = { kind: "date", x: r.left, y: r.bottom + 6 };
+  }
+
+  async function openLink(item: Item) {
+    menu = null;
+    try {
+      await api.openUrl(item.preview.trim());
+      api.hide();
+    } catch (err) {
+      showToast(String(err));
+    }
+  }
+
+  function openKindMenu() {
+    if (!kindBtn) return;
+    const r = kindBtn.getBoundingClientRect();
+    menu = { kind: "kind", x: r.left, y: r.bottom + 6 };
+  }
+
+  function setKind(k: KindFilter | null) {
+    kindFilter = k;
+    reload(false);
+  }
+
+  /** 続けて貼る: 選んだ順に、⌘V / Ctrl+V のたびに次がクリップボードに入る */
+  async function startQueue(ids = targetIds()) {
+    menu = null;
+    try {
+      const n = await api.startQueue(ids);
+      if (n) showToast(`${n}件を順番に貼れます。${MOD}V のたびに次へ進みます`);
+    } catch (err) {
+      showToast(String(err));
+    }
+  }
+
+  /** Space: 大きく表示（もう一度 Space / Esc で閉じる） */
+  async function togglePreview() {
+    preview = !preview;
+    if (preview) await loadPreview();
+  }
+
+  async function loadPreview() {
+    const it = items[focusIdx];
+    previewText = it && it.kind === "text" ? ((await api.itemText(it.id)) ?? "") : null;
   }
 
   function setDateRange(r: DateRange) {
@@ -443,6 +519,21 @@
         })),
       ];
     }
+    if (menu.kind === "kind") {
+      return [
+        { label: "すべての種類", icon: "filter", checked: !kindFilter, run: () => setKind(null) },
+        ...(Object.keys(KIND_LABEL) as KindFilter[]).map((k): MenuEntry => ({
+          label: KIND_LABEL[k],
+          icon: KIND_ICON[k],
+          checked: kindFilter === k,
+          hint: `/${KIND_LABEL[k]}`,
+          run: () => setKind(k),
+        })),
+      ];
+    }
+    if (menu.kind === "transform") {
+      return TRANSFORMS.map(([key, label]): MenuEntry => ({ label, icon: "text", run: () => paste(targetIds(), false, false, key) }));
+    }
     if (menu.kind === "date") {
       return (Object.keys(DATE_RANGE_LABEL) as DateRange[]).map((r): MenuEntry => ({
         label: DATE_RANGE_LABEL[r],
@@ -450,6 +541,26 @@
         checked: dateRange === r,
         run: () => setDateRange(r),
       }));
+    }
+    if (menu.kind === "moretags") {
+      return [
+        ...hiddenTags.map((t): MenuEntry => ({
+          label: t.name,
+          dot: t.color,
+          checked: tab.kind === "saved" && tab.tag === t.id,
+          run: () => setTab({ kind: "saved", tag: t.id }),
+        })),
+        { kind: "sep" },
+        {
+          label: "タグの名前・色を編集…",
+          icon: "edit",
+          keepOpen: true,
+          run: () => {
+            const m = menu;
+            if (m) menu = { kind: "tagedit", x: m.x, y: m.y };
+          },
+        },
+      ];
     }
     if (menu.kind === "tagedit") {
       // 編集するタグを選ぶ
@@ -480,14 +591,30 @@
     const list: MenuEntry[] = [
       { label: `貼り付け${n}`, icon: "paste", hint: K.enter, run: () => paste() },
       { label: "コピーのみ", icon: "copy", hint: `${MOD}C`, run: () => { paste(targetIds(), true); showToast("クリップボードにコピーしました"); } },
-      { label: item.favorite ? "お気に入りを外す" : "お気に入りに追加", icon: item.favorite ? "star-fill" : "star", hint: `${MOD}D`, run: () => toggleFavorite() },
+      { label: item.saved ? `保存から外す${n}` : `保存${n}`, icon: item.saved ? "star-fill" : "star", hint: `${MOD}D`, run: () => toggleSaved() },
+      { label: item.saved ? "タイトル・内容を編集…" : "名前を付けて保存…", icon: "edit", hint: `${MOD}E`, run: () => openEditor(item) },
     ];
-    if (item.kind === "text") {
+    if (selected.length > 1) {
+      list.splice(1, 0, { label: `順番に貼る（${MOD}V ごとに1件）`, icon: "queue", run: () => startQueue() });
+    }
+    if (item.kind === "file") {
+      list.push({ label: "パスをテキストで貼り付け", icon: "text", run: () => paste(targetIds(), false, true) });
+    } else if (item.kind === "text" && !item.translated && isLink(item.preview)) {
+      list.push({ label: "ブラウザで開く", icon: "external", hint: `${MOD}T`, run: () => openLink(item) });
+    } else if (item.kind === "text") {
+      list.push({
+        label: "形を変えて貼り付け…",
+        icon: "edit",
+        keepOpen: true,
+        run: () => {
+          const m = menu;
+          if (m) menu = { kind: "transform", itemId: item.id, x: m.x + 16, y: m.y };
+        },
+      });
       list.push(
         item.translated
           ? { label: "元の文に戻す", icon: "globe", hint: `${MOD}T`, run: () => revert(item) }
           : { label: "翻訳", icon: "globe", hint: `${MOD}T`, run: () => runAction(item) },
-        { label: item.snippet ? "定型文を編集" : "定型文として保存", icon: "edit", hint: `${MOD}E`, run: () => editSnippet(item) },
       );
     } else {
       list.push({ label: "文字起こし", icon: "scan", hint: `${MOD}T`, run: () => runAction(item) });
@@ -536,7 +663,7 @@
 
   /** 選択中のタグタブのメニュー（キーボード用） */
   function openTagPillMenu() {
-    if (tab.kind !== "tag") {
+    if (tab.kind !== "saved" || tab.tag == null) {
       if (!tags.length) {
         showToast("タグがまだありません（＋ または " + MOD + "G から作成）", undefined, 2500);
         return;
@@ -545,14 +672,14 @@
       menu = { kind: "tagedit", ...placeMenu(p.x, p.y, 200) };
       return;
     }
-    const el = document.querySelector<HTMLElement>(`[data-tag="${tab.id}"]`);
+    const el = document.querySelector<HTMLElement>(`[data-tag="${tab.tag}"]`);
     const r = el?.getBoundingClientRect();
-    menu = { kind: "tagpill", tagId: tab.id, ...placeMenu(r?.left ?? 40, (r?.bottom ?? 40) + 6, 260) };
+    menu = { kind: "tagpill", tagId: tab.tag, ...placeMenu(r?.left ?? 40, (r?.bottom ?? 40) + 6, 260) };
   }
 
   async function deleteTag(t: Tag) {
     await api.deleteTag(t.id);
-    if (tab.kind === "tag" && tab.id === t.id) tab = { kind: "all" };
+    if (tab.kind === "saved" && tab.tag === t.id) tab = { kind: "saved", tag: null };
     reload();
   }
 
@@ -561,31 +688,125 @@
     openCardMenu(idx, { x: e.clientX, y: e.clientY });
   }
 
-  async function editSnippet(item: Item | null) {
+  /** 保存の編集画面。item が履歴なら、保存すると保存に移る。null なら新規 */
+  async function openEditor(item: Item | null) {
     menu = null;
     if (!item) {
-      editor = { id: null, title: "", text: "" };
+      editor = { id: null, title: "", keyword: "", text: "" };
       return;
     }
-    const text = (await api.itemText(item.id)) ?? "";
-    editor = { id: item.snippet ? item.id : null, title: item.snippet ? (item.title ?? "") : "", text };
+    const text = item.kind === "text" ? ((await api.itemText(item.id)) ?? "") : null;
+    editor = { id: item.id, title: item.title ?? "", keyword: item.keyword ?? "", text };
+  }
+
+  /** 差し込み記号を本文のカーソル位置に入れる */
+  async function insertPlaceholder(ph: string) {
+    const el = editorText;
+    if (!editor || editor.text == null || !el) return;
+    const a = el.selectionStart ?? editor.text.length;
+    const b = el.selectionEnd ?? a;
+    editor.text = editor.text.slice(0, a) + ph + editor.text.slice(b);
+    await tick();
+    el.focus();
+    el.setSelectionRange(a + ph.length, a + ph.length);
   }
 
   async function saveEditor() {
     if (!editor) return;
+    const ed = editor;
     try {
-      await api.saveSnippet(editor.id, editor.title, editor.text);
+      const id = await api.saveItem(ed.id, ed.title, ed.keyword, ed.text);
+      // タグで絞り込み中に新しく作ったら、そのタグを付ける
+      if (ed.id == null && tab.kind === "saved" && tab.tag != null) await api.setTag([id], tab.tag, true);
       editor = null;
-      setTab({ kind: "snippet" });
+      if (tab.kind !== "saved") {
+        showToast("保存しました", { label: "保存を開く", run: () => setTab({ kind: "saved", tag: null }) });
+      }
+      await reload();
     } catch (err) {
       showToast(String(err));
     }
   }
 
-  function cycleTab(dir: number) {
-    const all: Tab[] = [{ kind: "all" }, { kind: "favorite" }, { kind: "snippet" }, ...tags.map((t) => ({ kind: "tag", id: t.id }) as Tab)];
-    const i = all.findIndex((t) => t.kind === tab.kind && (t.kind !== "tag" || (tab.kind === "tag" && t.id === tab.id)));
-    setTab(all[(i + dir + all.length) % all.length]);
+  function sameTab(a: Tab, b: Tab): boolean {
+    return a.kind === b.kind && (a.kind !== "saved" || (b.kind === "saved" && a.tag === b.tag));
+  }
+
+  /** Tab は履歴と保存の行き来だけ（タグは検索欄の #名前 かクリックで選ぶ） */
+  function cycleTab() {
+    setTab(tab.kind === "history" ? { kind: "saved", tag: null } : { kind: "history" });
+  }
+
+  /** タグのボタンを入るだけ並べる（残りは「その他 ▾」） */
+  let tagZoneW = $state(0);
+  let measureEl = $state<HTMLDivElement | null>(null);
+  let moreBtn = $state<HTMLButtonElement | null>(null);
+  let tagWidths = $state<number[]>([]);
+  $effect(() => {
+    tags;
+    tick().then(() => {
+      tagWidths = measureEl ? [...measureEl.children].map((c) => (c as HTMLElement).offsetWidth) : [];
+    });
+  });
+  const fitCount = $derived.by(() => {
+    const GAP = 6, PLUS = (addingTag ? 116 : 28) + GAP, MORE = 96 + GAP;
+    const n = tags.length;
+    let used = PLUS;
+    for (let i = 0; i < n; i++) {
+      const w = (tagWidths[i] ?? 80) + GAP;
+      const rest = i < n - 1 ? MORE : 0; // まだ後ろがあるなら「その他」の分を空けておく
+      if (used + w + rest > tagZoneW) return i;
+      used += w;
+    }
+    return n;
+  });
+  const shownTags = $derived(tags.slice(0, fitCount));
+  const hiddenTags = $derived(tags.slice(fitCount));
+
+  function openMoreTags() {
+    const r = moreBtn?.getBoundingClientRect();
+    menu = { kind: "moretags", ...placeMenu(r?.left ?? 40, (r?.bottom ?? 40) + 6, 260) };
+  }
+
+  /** 検索欄の #名前 に当てはまるタグ（タグのボタンを光らせる） */
+  const tagWords = $derived(
+    query.split(/\s+/).filter((w) => /^[#＃]./.test(w)).map((w) => w.slice(1).toLowerCase()),
+  );
+  const tagHit = (t: Tag) => tagWords.some((w) => t.name.toLowerCase().startsWith(w));
+  /**
+   * #名前 の候補一覧。tagPrefix は自分で打った部分（候補はこれで決まる）。
+   * ↑↓ で選ぶと検索欄の #… がそのタグ名に置き換わり、すぐ絞り込まれる。Enter は普段どおり貼り付け
+   */
+  let tagPrefix = $state<string | null>(null);
+  let tagOpen = $state(false);
+  let tagIdx = $state(-1);
+  const tagHits = $derived(
+    tagPrefix == null ? [] : tags.filter((t) => t.name.toLowerCase().startsWith(tagPrefix!.toLowerCase())),
+  );
+  const TAG_TAIL = /(?:^|\s)[#＃](\S*)$/;
+
+  /** 検索欄の入力に合わせて候補を開く/閉じる */
+  function syncTagPrefix() {
+    tagPrefix = query.match(TAG_TAIL)?.[1] ?? null;
+    tagOpen = tagPrefix != null;
+    tagIdx = -1;
+  }
+
+  function closeTags() {
+    tagOpen = false;
+  }
+
+  /** 候補のタグで絞り込む（検索欄の末尾の #… を置き換える） */
+  function applyTag(t: Tag) {
+    query = query.replace(/[#＃]\S*$/, `#${t.name}`);
+    reload(false);
+  }
+
+  function moveTag(d: 1 | -1) {
+    const n = tagHits.length;
+    tagIdx = tagIdx < 0 ? (d > 0 ? 0 : n - 1) : (tagIdx + d + n) % n;
+    applyTag(tagHits[tagIdx]);
+    tick().then(() => document.querySelector(".taghits .cur")?.scrollIntoView({ block: "nearest" }));
   }
 
   let composing = false;
@@ -626,6 +847,48 @@
     if (menu && menuRef?.handleKey(e)) return;
     if (menu && (e.key === "ArrowRight" || e.key.length === 1)) return;
 
+    // 大きく表示中: Space / Esc で閉じる。←→ で隣へ（中身も入れ替わる）
+    if (preview) {
+      if (e.key === " " || e.key === "Escape") {
+        e.preventDefault();
+        preview = false;
+        return;
+      }
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        e.preventDefault();
+        move(e.key === "ArrowRight" ? 1 : -1, false);
+        loadPreview();
+        return;
+      }
+    }
+    // 検索欄が空のときの Space は「大きく表示」
+    if (e.key === " " && !query && !mod && !e.shiftKey) {
+      e.preventDefault();
+      if (items[focusIdx]) togglePreview();
+      return;
+    }
+
+    // #名前 の候補: ↑↓ で選ぶ（選んだ時点で絞り込み）。←→ でカードへ移ると閉じる。Enter は普段どおり貼り付け
+    if (!mod && !e.altKey && tagPrefix != null && tagHits.length) {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        // 閉じていても、末尾が #… のままなら ↓ で開き直す
+        if (tagOpen || (e.key === "ArrowDown" && TAG_TAIL.test(query))) {
+          e.preventDefault();
+          tagOpen = true;
+          moveTag(e.key === "ArrowDown" ? 1 : -1);
+          return;
+        }
+      }
+    }
+    if (tagOpen) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeTags();
+        return;
+      }
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Enter" || e.key === "Tab") closeTags();
+    }
+
     // ⌥←→（Windows は Alt+←→）で検索欄の文字カーソルを動かす（←→ 単体はカード移動）
     if (e.altKey && !mod && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
       e.preventDefault();
@@ -651,7 +914,7 @@
         e.preventDefault();
         if (menu) menu = null;
         else if (selected.length > 1) clearMultiSelect();
-        else if (query) { query = ""; reload(false); }
+        else if (query) { query = ""; syncTagPrefix(); reload(false); }
         else api.hide();
         return;
       case "ArrowRight":
@@ -706,7 +969,7 @@
         return;
       case "Tab":
         e.preventDefault();
-        cycleTab(e.shiftKey ? -1 : 1);
+        cycleTab();
         return;
     }
 
@@ -725,7 +988,7 @@
         selected = items.map((i) => i.id);
       } else if (k === "d") {
         e.preventDefault();
-        toggleFavorite();
+        toggleSaved();
       } else if (k === "t") {
         e.preventDefault();
         const it = items[focusIdx];
@@ -740,6 +1003,9 @@
       } else if (k === "[" || k === "]") {
         e.preventDefault();
         jumpDay(k === "]" ? 1 : -1);
+      } else if (k === "i") {
+        e.preventDefault();
+        openKindMenu();
       } else if (k === "y") {
         e.preventDefault();
         openDateMenu();
@@ -752,7 +1018,7 @@
       } else if (k === "e") {
         e.preventDefault();
         const it = items[focusIdx];
-        if (it?.kind === "text") editSnippet(it);
+        if (it) openEditor(it);
       } else if (k === "/") {
         e.preventDefault();
         help = true;
@@ -761,7 +1027,7 @@
         remove();
       } else if (k === "n") {
         e.preventDefault();
-        editSnippet(null);
+        openEditor(null);
       } else if (k === ",") {
         e.preventDefault();
         api.openSettings();
@@ -814,6 +1080,9 @@
 
   let searchTimer: ReturnType<typeof setTimeout>;
   function onSearch() {
+    syncTagPrefix();
+    // タグは保存の中の分類なので、#名前 を打ったら保存タブで探す
+    if (tab.kind === "history" && /(?:^|\s)[#＃]/.test(query)) tab = { kind: "saved", tag: null };
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => reload(false), 120);
   }
@@ -836,14 +1105,17 @@
     maxRows = s.panel_rows;
     groupByDate = s.group_by_date;
     opacity = s.panel_opacity;
+    cardSize = s.card_size;
   }
 
   onMount(() => {
     reload(false);
     applySettings();
+    api.getPaused().then((p) => (paused = p));
     const timer = setInterval(() => (now = Date.now()), 5000);
     const unsubs = [
       listen("clips-changed", () => reload()),
+      listen<boolean>("paused-changed", (e) => (paused = e.payload)),
       listen("settings-changed", applySettings),
       listen("panel-shown", async () => {
         now = Date.now();
@@ -851,7 +1123,9 @@
         help = false;
         addingTag = false;
         editor = null;
+        preview = false;
         query = "";
+        syncTagPrefix();
         await reload(false);
         listEl?.scrollTo({ left: 0 });
         await tick();
@@ -879,12 +1153,19 @@
 <div
   class="panel"
   style:--rows={rows}
+  style:--card-w="{CARD_W}px"
+  style:--lines={CARD_SIZES[cardSize].lines}
   style:--glass="rgba(22, 23, 28, {opacity / 100})"
-  onclick={() => (menu = null)}
+  onclick={() => { menu = null; closeTags(); }}
   onmousedown={onPanelMouseDown}
 >
   <div class="bar">
     <span class="logo">Clipo</span>
+    {#if paused}
+      <button class="pausedpill" title="クリックで記録を再開" onclick={() => api.setPaused(false)}>
+        <Icon name="pause" size={11} />記録停止中
+      </button>
+    {/if}
 
     <div class="appfilter">
       <button
@@ -905,11 +1186,13 @@
       </button>
     </div>
 
+    <!-- 保存タブでも場所は残す（タブ切り替えで位置がずれないように） -->
     <button
       class="appbtn datebtn"
       bind:this={dateBtn}
-      class:active={dateRange !== "all"}
-      title="期間で絞り込み（{MOD}Y）"
+      class:active={dateRange !== "all" && tab.kind === "history"}
+      disabled={tab.kind !== "history"}
+      title={tab.kind === "history" ? `期間で絞り込み（${MOD}Y）` : "期間の絞り込みは履歴だけです"}
       onclick={(e) => { e.stopPropagation(); if (menu?.kind === "date") menu = null; else openDateMenu(); }}
     >
       <Icon name="calendar" size={14} />
@@ -917,71 +1200,126 @@
       <Icon name="chevron" size={12} />
     </button>
 
+    <button
+      class="appbtn datebtn"
+      bind:this={kindBtn}
+      class:active={kindFilter}
+      title="種類で絞り込み（{MOD}I・検索欄に /画像 なども可）"
+      onclick={(e) => { e.stopPropagation(); if (menu?.kind === "kind") menu = null; else openKindMenu(); }}
+    >
+      <Icon name={kindFilter ? KIND_ICON[kindFilter] : "filter"} size={14} />
+      {#if kindFilter}<span>{KIND_LABEL[kindFilter]}</span>{/if}
+      <Icon name="chevron" size={12} />
+    </button>
+
     <div class="tabs" role="tablist">
-      <button class="pill" class:on={tab.kind === "all"} onclick={() => setTab({ kind: "all" })}>すべて</button>
-      <button class="pill" class:on={tab.kind === "favorite"} onclick={() => setTab({ kind: "favorite" })}>
-        <span class="star"><Icon name="star-fill" size={11} /></span>お気に入り
-      </button>
-      <button class="pill" class:on={tab.kind === "snippet"} onclick={() => setTab({ kind: "snippet" })}>定型文</button>
-      {#each tags as t (t.id)}
-        {#if renaming?.id === t.id}
+      <div class="seg">
+        <button class:on={tab.kind === "history"} onclick={() => setTab({ kind: "history" })}>
+          <Icon name="text" size={12} />履歴
+        </button>
+        <button class:on={tab.kind === "saved"} onclick={() => setTab({ kind: "saved", tag: null })}>
+          <span class="star"><Icon name="star-fill" size={12} /></span>保存
+        </button>
+      </div>
+      {#if tab.kind === "saved"}
+      <span class="tagsep"></span>
+      <button class="pill" class:on={tab.tag == null} onclick={() => setTab({ kind: "saved", tag: null })}>すべて</button>
+      {/if}
+      <!-- タグ: 入るだけ並べ、入りきらない分は「その他 ▾」へ -->
+      <div class="tagzone" bind:clientWidth={tagZoneW}>
+        {#if tab.kind === "saved"}
+        {#each shownTags as t (t.id)}
+          {#if renaming?.id === t.id}
+            <input
+              class="taginput"
+              bind:this={renameInput}
+              bind:value={renaming.name}
+              onkeydown={(e) => {
+                if (isImeKey(e)) return;
+                if (e.key === "Enter" || e.key === "Escape") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (e.key === "Enter") commitRename();
+                  else renaming = null;
+                }
+              }}
+              onblur={() => { if (renaming) renaming = null; }}
+            />
+          {:else}
+          <button
+            data-tag={t.id}
+            class="pill"
+            class:on={tab.kind === "saved" && tab.tag === t.id}
+            class:hit={tagHit(t)}
+            onclick={() => setTab({ kind: "saved", tag: t.id })}
+            oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); menu = { kind: "tagpill", tagId: t.id, ...placeMenu(e.clientX, e.clientY, 100) }; }}
+            ondblclick={() => startRename(t)}
+            title="右クリック: 名前・色の変更、削除（{MOD}{K.shift}K） / ダブルクリック: 名前を変更"
+          ><i style:background={t.color}></i>{t.name}</button>
+          {/if}
+        {/each}
+        {#if hiddenTags.length}
+          {@const cur = hiddenTags.find((t) => tab.kind === "saved" && tab.tag === t.id)}
+          <button
+            class="pill more"
+            class:on={!!cur}
+            class:hit={hiddenTags.some(tagHit)}
+            bind:this={moreBtn}
+            title="ほかのタグ"
+            onclick={(e) => { e.stopPropagation(); if (menu?.kind === "moretags") menu = null; else openMoreTags(); }}
+          >
+            {#if cur}<i style:background={cur.color}></i>{cur.name}{:else}その他 {hiddenTags.length}{/if}
+            <Icon name="chevron" size={12} />
+          </button>
+        {/if}
+        {/if}
+        {#if addingTag}
+          <!-- svelte-ignore a11y_autofocus -->
           <input
             class="taginput"
-            bind:this={renameInput}
-            bind:value={renaming.name}
+            placeholder={newTagTargets.length ? "付けるタグ名" : "新しいタグ名"}
+            bind:this={tagInput}
+            bind:value={newTagName}
+            autofocus
             onkeydown={(e) => {
               if (isImeKey(e)) return;
               if (e.key === "Enter" || e.key === "Escape") {
+                // パネル側の「貼り付け/閉じる」に伝わらないようにする
                 e.preventDefault();
                 e.stopPropagation();
-                if (e.key === "Enter") commitRename();
-                else renaming = null;
+                if (e.key === "Enter") commitNewTag();
+                else cancelNewTag();
+                tick().then(keepSearchFocus);
               }
             }}
-            onblur={() => { if (renaming) renaming = null; }}
+            onblur={() => { if (addingTag) cancelNewTag(); }}
           />
-        {:else}
-        <button
-          data-tag={t.id}
-          class="pill"
-          class:on={tab.kind === "tag" && tab.id === t.id}
-          onclick={() => setTab({ kind: "tag", id: t.id })}
-          oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); menu = { kind: "tagpill", tagId: t.id, ...placeMenu(e.clientX, e.clientY, 100) }; }}
-          ondblclick={() => startRename(t)}
-          title="右クリック: 名前・色の変更、削除（{MOD}{K.shift}K） / ダブルクリック: 名前を変更"
-        ><i style:background={t.color}></i>{t.name}</button>
+        {:else if tab.kind === "saved"}
+          <button class="plus" title="タグを作成" onclick={() => startNewTag()}><Icon name="plus" size={14} /></button>
         {/if}
-      {/each}
-      {#if addingTag}
-        <!-- svelte-ignore a11y_autofocus -->
-        <input
-          class="taginput"
-          placeholder={newTagTargets.length ? "付けるタグ名" : "新しいタグ名"}
-          bind:this={tagInput}
-          bind:value={newTagName}
-          autofocus
-          onkeydown={(e) => {
-            if (isImeKey(e)) return;
-            if (e.key === "Enter" || e.key === "Escape") {
-              // パネル側の「貼り付け/閉じる」に伝わらないようにする
-              e.preventDefault();
-              e.stopPropagation();
-              if (e.key === "Enter") commitNewTag();
-              else cancelNewTag();
-              tick().then(keepSearchFocus);
-            }
-          }}
-          onblur={() => { if (addingTag) cancelNewTag(); }}
-        />
-      {:else}
-        <button class="plus" title="タグを作成" onclick={() => startNewTag()}><Icon name="plus" size={14} /></button>
-      {/if}
+      </div>
+      <!-- 幅を測るためだけの見えない並び -->
+      <div class="tagmeasure" aria-hidden="true" bind:this={measureEl}>
+        {#each tags as t (t.id)}<span class="pill"><i></i>{t.name}</span>{/each}
+      </div>
     </div>
 
     <div class="tools">
       <label class="search">
         <Icon name="search" size={14} />
-        <input bind:this={searchEl} bind:value={query} oninput={onSearch} placeholder="検索" spellcheck="false" />
+        <input bind:this={searchEl} bind:value={query} oninput={onSearch} placeholder="検索（#でタグ）" spellcheck="false" />
+        {#if tagOpen}
+          <div class="taghits">
+            {#each tagHits as t, n (t.id)}
+              <button class:cur={n === tagIdx} onclick={(e) => { e.stopPropagation(); tagIdx = n; applyTag(t); closeTags(); keepSearchFocus(); }}>
+                <i style:background={t.color}></i>{t.name}
+              </button>
+            {:else}
+              <span>{tags.length ? "一致するタグはありません" : "タグがまだありません"}</span>
+            {/each}
+            {#if tagHits.length}<small>↑↓ でタグ・←→ でカード・{K.enter} で貼り付け</small>{/if}
+          </div>
+        {/if}
       </label>
       <button class="tool" title="範囲を選んで文字起こし" onclick={() => api.ocrCapture()}><Icon name="scan" size={16} /></button>
       {#if screenshotEnabled}
@@ -992,9 +1330,9 @@
   </div>
 
   {#snippet newCard()}
-    <button class="newcard" onclick={() => editSnippet(null)}>
+    <button class="newcard" onclick={() => openEditor(null)}>
       <Icon name="plus" size={22} />
-      <span>新しい定型文</span>
+      <span>テキストを作って保存</span>
       <small>{MOD}N</small>
     </button>
   {/snippet}
@@ -1022,7 +1360,13 @@
   <div class="list" class:paged bind:this={listEl} onwheel={onWheel} role="listbox" aria-multiselectable="true">
     {#if !items.length && !lead}
       <div class="emptylist">
-        {query ? `「${query}」に一致する履歴はありません` : "ここにコピーした履歴が並びます"}
+        {#if query || kindFilter || sourceId || dateRange !== "all"}
+          <b>当てはまるものはありません</b>
+          <span>検索や絞り込みを変えてみてください{query ? `（${MOD}F で検索欄、Esc で検索をクリア）` : ""}</span>
+        {:else}
+          <b>ここにコピーした履歴が並びます</b>
+          <span>何かをコピーするとカードになります。よく使うものは {MOD}D で「保存」へ</span>
+        {/if}
       </div>
     {:else if paged}
       {#each pages as page, p (p)}
@@ -1059,6 +1403,7 @@
     {#if selected.length > 1}
       <span class="multi">{selected.length}件を選択中</span>
       <button class="pastebtn" onclick={() => paste()}>まとめて貼り付け {K.enter}</button>
+      <button class="pastebtn ghostbtn" onclick={() => startQueue()}>順番に貼る（{MOD}V ごと）</button>
       <button class="link" onclick={clearMultiSelect}>選択解除（Esc）</button>
     {:else}
       <span><b>←→</b> 移動</span>
@@ -1067,11 +1412,15 @@
       <span><b>{MOD}1-9</b> 直接貼り付け</span>
       <span><b>{MOD}K</b> メニュー</span>
       <span><b>{MOD}T</b> 翻訳</span>
+      <span><b>Space</b> 大きく表示</span>
+      <span><b>{MOD}D</b> 保存</span>
       <span><b>{MOD}G</b> タグ</span>
       <span><b>{MOD}O</b> アプリ</span>
       <span><b>{MOD}Y</b> 期間</span>
+      <span><b>{MOD}I</b> 種類</span>
       <span><b>{MOD}[ ]</b> 前後の日</span>
-      <span><b>Tab</b> 切替</span>
+      <span><b>Tab</b> 履歴/保存</span>
+      <span><b>#</b> タグで絞り込み</span>
       <span><b>{MOD}/</b> すべてのキー</span>
     {/if}
   </div>
@@ -1080,6 +1429,38 @@
     {#key menu.kind}
       <Menu bind:this={menuRef} entries={menuEntries} x={menu.x} y={menu.y} onclose={() => { menu = null; keepSearchFocus(); }} />
     {/key}
+  {/if}
+
+  {#if preview && items[focusIdx]}
+    {@const it = items[focusIdx]}
+    <div class="overlay" onclick={() => (preview = false)}>
+      <div class="preview" onclick={(e) => e.stopPropagation()}>
+        <header>
+          <b>{it.title || (it.kind === "image" ? "画像" : it.kind === "file" ? "ファイル" : isLink(it.preview) ? "リンク" : "テキスト")}</b>
+          {#if it.kind === "image" && it.width}<small>{it.width}×{it.height}</small>{/if}
+          {#if previewText != null}<small>{previewText.length}字</small>{/if}
+          <span class="sp"></span>
+          {#if it.kind === "text" && isLink(it.preview)}
+            <button class="pastebtn" onclick={() => openLink(it)}>ブラウザで開く</button>
+          {/if}
+          <button class="pastebtn" onclick={() => paste([it.id])}>貼り付け {K.enter}</button>
+          <small>Space / Esc で閉じる・←→ で隣へ</small>
+        </header>
+        <div class="pbody">
+          {#if it.kind === "image"}
+            <img src={fileSrc(it.image_path)} alt="" draggable="false" />
+          {:else if it.kind === "file"}
+            <ul class="pfiles">
+              {#each it.preview.split("\n").filter(Boolean) as p, n (n)}
+                <li><b>{fileNames(p)[0]}</b><small>{p}</small></li>
+              {/each}
+            </ul>
+          {:else}
+            <pre>{previewText ?? it.preview}</pre>
+          {/if}
+        </div>
+      </div>
+    </div>
   {/if}
 
   {#if help}
@@ -1098,21 +1479,26 @@
             <dt>Esc</dt><dd>選択解除 → 検索クリア → 閉じる</dd>
             <dt>{K.enter}</dt><dd>貼り付け（複数なら選んだ順に）</dd>
             <dt>{K.shift}{K.enter} / {MOD}C</dt><dd>コピーのみ</dd>
-            <dt>{MOD}1〜9</dt><dd>その番号のカードを貼り付け</dd>
+            <dt>{MOD}1〜9</dt><dd>その番号のカードを貼り付け（保存はよく使う順）</dd>
           </dl>
           <dl>
             <dt>文字を入力</dt><dd>そのまま検索（{MOD}F）</dd>
             <dt>{K.alt}← / {K.alt}→</dt><dd>検索欄の文字カーソルを移動（{K.shift}で選択）</dd>
-            <dt>Tab / {K.shift}Tab</dt><dd>タブ切り替え</dd>
+            <dt>Tab</dt><dd>履歴 / 保存 を切り替え</dd>
+            <dt>#名前</dt><dd>タグで絞り込み（# だけで候補一覧、↑↓ で選ぶとすぐ絞り込み）</dd>
             <dt>{MOD}O</dt><dd>コピー元アプリで絞り込み</dd>
             <dt>{MOD}Y</dt><dd>期間で絞り込み</dd>
+            <dt>{MOD}I</dt><dd>種類で絞り込み（検索欄に /画像 /リンク なども可）</dd>
+            <dt>Space</dt><dd>大きく表示（←→ で隣へ・Space / Esc で閉じる）</dd>
             <dt>{MOD}[ / {MOD}]</dt><dd>前の日 / 次の日の先頭へ</dd>
             <dt>{MOD}K</dt><dd>メニュー（↑↓ {K.enter}）</dd>
-            <dt>{MOD}G</dt><dd>タグを付ける / 外す・新規作成</dd>
+            <dt>{MOD}G</dt><dd>タグを付ける / 外す・新規作成（付けると保存に入る）</dd>
             <dt>{MOD}{K.shift}K</dt><dd>タグの名前・色の変更、削除（{MOD}G のメニューからも）</dd>
-            <dt>{MOD}D</dt><dd>お気に入り</dd>
-            <dt>{MOD}T</dt><dd>翻訳 / 元に戻す・画像は文字起こし</dd>
-            <dt>{MOD}E / {MOD}N</dt><dd>定型文にする / 新しい定型文</dd>
+            <dt>{MOD}D</dt><dd>保存する / 保存から外す</dd>
+            <dt>{MOD}T</dt><dd>翻訳 / 元に戻す・画像は文字起こし・リンクは開く</dd>
+            <dt>{MOD}K</dt><dd>メニュー：形を変えて貼る、順番に貼る（複数選択時）</dd>
+            <dt>{MOD}E</dt><dd>タイトル・短い名前・内容を編集して保存</dd>
+            <dt>{MOD}N</dt><dd>テキストを作って保存</dd>
             <dt>{MOD}{K.del}</dt><dd>削除</dd>
             <dt>{MOD},</dt><dd>設定</dd>
           </dl>
@@ -1125,8 +1511,19 @@
     <div class="overlay" onclick={() => (editor = null)}>
       <div class="editor" onclick={(e) => e.stopPropagation()}>
         <!-- svelte-ignore a11y_autofocus -->
-        <input bind:value={editor.title} placeholder="タイトル（例: 住所、署名）" autofocus />
-        <textarea bind:value={editor.text} placeholder="定型文の本文"></textarea>
+        <div class="fields">
+          <input class="grow" bind:value={editor.title} placeholder="タイトル（例: 住所、署名）" autofocus />
+          <input class="kwin" bind:value={editor.keyword} placeholder="短い名前（例: sig）" spellcheck="false" />
+        </div>
+        {#if editor.text != null}
+          <textarea bind:this={editorText} bind:value={editor.text} placeholder="本文"></textarea>
+          <div class="phs">
+            <span>差し込み:</span>
+            {#each PLACEHOLDERS as ph (ph)}
+              <button onclick={() => insertPlaceholder(ph)}>{ph}</button>
+            {/each}
+          </div>
+        {/if}
         <div class="row">
           <span class="hint">{MOD}⏎ で保存 / Esc で閉じる</span>
           <button class="link" onclick={() => (editor = null)}>キャンセル</button>
@@ -1149,7 +1546,6 @@
 
 <style>
   .panel {
-    --card-w: 236px;
     position: fixed;
     inset: 0;
     display: flex;
@@ -1182,6 +1578,7 @@
   }
   .appbtn.active { border-color: var(--accent); color: var(--fg); }
   .datebtn { flex: none; gap: 4px; font-size: 12px; font-weight: 600; }
+  .datebtn:disabled { opacity: 0.35; cursor: default; }
   .appbtn img { width: 16px; height: 16px; }
   .mini {
     width: 16px; height: 16px; border-radius: 50%;
@@ -1214,8 +1611,32 @@
     box-shadow: 0 2px 10px color-mix(in srgb, var(--accent) 45%, transparent);
   }
   .pill i { width: 8px; height: 8px; border-radius: 50%; }
-  .pill .star { color: #fbbf24; display: flex; }
-  .pill.on .star { color: #fff3b0; }
+  /* 履歴 / 保存 の切り替え */
+  .seg {
+    flex: none; display: flex; padding: 2px; gap: 2px;
+    height: 30px; border-radius: 10px;
+    background: var(--btn); border: 1px solid var(--line);
+  }
+  .seg button {
+    display: flex; align-items: center; gap: 5px;
+    padding: 0 12px; border-radius: 8px;
+    font-size: 12.5px; font-weight: 700; color: var(--fg-dim);
+  }
+  .seg button:hover { color: var(--fg); }
+  .seg button.on {
+    background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 85%, white), var(--accent));
+    color: #fff;
+    box-shadow: 0 2px 10px color-mix(in srgb, var(--accent) 45%, transparent);
+  }
+  .seg .star { color: #fbbf24; display: flex; }
+  .seg button.on .star { color: #fff3b0; }
+  .tagzone { flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; overflow: hidden; }
+  .pill.more { gap: 4px; }
+  .tagmeasure {
+    position: absolute; left: -9999px; top: 0;
+    display: flex; gap: 6px; visibility: hidden; pointer-events: none;
+  }
+  .tagsep { flex: none; width: 1px; height: 18px; background: var(--line-strong); margin: 0 2px; }
   .plus { width: 28px; height: 28px; flex: none; display: grid; place-items: center; border-radius: 50%; color: var(--fg-dim); }
   .plus:hover { background: var(--hover); color: var(--fg); }
   .taginput {
@@ -1236,6 +1657,23 @@
   .search:focus-within { border-color: var(--accent); color: var(--fg); }
   .search input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--fg); font-size: 13px; }
   .search input::placeholder { color: var(--fg-dim); }
+  .search { position: relative; }
+  .taghits {
+    position: absolute; z-index: 30; top: calc(100% + 6px); right: 0;
+    min-width: 100%; max-height: 220px; overflow-y: auto; padding: 6px;
+    display: flex; flex-direction: column; gap: 2px;
+    border-radius: 10px; background: var(--menu); border: 1px solid var(--glass-border);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  }
+  .taghits button {
+    flex: none; display: flex; align-items: center; gap: 6px;
+    padding: 4px 8px; border-radius: 6px; text-align: left;
+    font-size: 12.5px; color: var(--fg); white-space: nowrap;
+  }
+  .taghits button.cur { background: var(--hover); outline: 1px solid var(--accent); }
+  .taghits i { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .taghits span, .taghits small { padding: 2px 8px; font-size: 11px; color: var(--fg-dim); white-space: nowrap; }
+  .pill.hit:not(.on) { color: var(--fg); border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
   .tool { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 8px; color: var(--fg-dim); }
   .tool:hover { background: var(--hover); color: var(--fg); }
 
@@ -1289,7 +1727,28 @@
   }
   .newcard:hover { color: var(--fg); border-color: var(--accent); }
   .newcard small { font-family: var(--mono); opacity: 0.6; }
-  .emptylist { margin: auto; color: var(--fg-dim); font-size: 13px; }
+  .emptylist { margin: auto; display: flex; flex-direction: column; align-items: center; gap: 6px; color: var(--fg-dim); font-size: 12px; text-align: center; }
+  .emptylist b { color: var(--fg); font-size: 14px; }
+  .pausedpill {
+    flex: none; height: 24px; padding: 0 10px; border-radius: 999px;
+    display: flex; align-items: center; gap: 5px;
+    background: #f59e0b; color: #1f1300; font-size: 11.5px; font-weight: 800;
+  }
+  .ghostbtn { background: transparent; border: 1px solid var(--accent); color: var(--fg); }
+  .preview {
+    width: min(900px, 94vw); height: calc(100vh - 40px);
+    display: flex; flex-direction: column; overflow: hidden;
+    border-radius: 14px; background: var(--menu); border: 1px solid var(--glass-border);
+  }
+  .preview header { flex: none; display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .preview header small { color: var(--fg-dim); font-size: 11px; }
+  .preview .sp { flex: 1; }
+  .pbody { flex: 1; min-height: 0; overflow: auto; padding: 12px 14px; }
+  .pbody pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 13px/1.6 var(--mono); color: var(--fg); user-select: text; }
+  .pbody img { max-width: 100%; max-height: 100%; display: block; margin: auto; object-fit: contain; }
+  .pfiles { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 8px; }
+  .pfiles li { display: flex; flex-direction: column; }
+  .pfiles small { color: var(--fg-dim); font-size: 11px; overflow-wrap: anywhere; }
 
   .hints {
     height: 26px; flex: none;
@@ -1329,6 +1788,15 @@
   }
   .editor input:focus, .editor textarea:focus { border-color: var(--accent); }
   .editor textarea { height: 110px; resize: none; }
+  .editor .fields { display: flex; gap: 8px; }
+  .editor .grow { flex: 1; min-width: 0; }
+  .editor .kwin { width: 150px; font-family: var(--mono); }
+  .editor .phs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 11px; color: var(--fg-dim); }
+  .editor .phs button {
+    padding: 2px 8px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--btn); color: var(--fg); font-size: 11.5px;
+  }
+  .editor .phs button:hover { border-color: var(--accent); }
   .editor .row { display: flex; align-items: center; gap: 10px; }
   .editor .hint { flex: 1; font-size: 11px; color: var(--fg-dim); }
   .editor .pastebtn { height: 28px; padding: 0 16px; font-size: 12.5px; }

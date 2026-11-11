@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { fileSrc, timeAgo, type Item, type Tag } from "./api";
+  import { fileNames, fileSrc, isLink, timeAgo, type Item, type Tag } from "./api";
   import Icon from "./Icon.svelte";
   import { untrack } from "svelte";
 
@@ -59,14 +59,36 @@
       setTimeout(() => (flip = ""), 580),
     ];
   });
-  const variant = $derived(item.snippet ? "snippet" : translated ? "translated" : item.kind);
+  /** URL だけのテキスト */
+  const link = $derived(item.kind === "text" && !translated && isLink(item.preview));
+  const url = $derived.by(() => {
+    if (!link) return null;
+    try {
+      const u = new URL(item.preview.trim());
+      return { host: u.host.replace(/^www\./, ""), rest: decodeURI(u.pathname + u.search + u.hash).replace(/^\/$/, "") };
+    } catch {
+      return { host: item.preview.trim(), rest: "" };
+    }
+  });
+  const variant = $derived(
+    translated ? "translated" : link ? "link" : item.saved && item.kind === "text" ? "saved" : item.kind,
+  );
+  const files = $derived(item.kind === "file" ? fileNames(item.preview) : []);
   const label = $derived(
-    item.snippet ? (item.title || "定型文") : translated ? "翻訳済み" : item.kind === "image" ? "画像" : "テキスト",
+    item.title ||
+      (translated ? "翻訳済み"
+        : link ? "リンク"
+        : item.kind === "image" ? "画像"
+        : item.kind === "file" ? (files.length > 1 ? `ファイル ${files.length}個` : "ファイル")
+        : item.saved ? "保存したテキスト" : "テキスト"),
+  );
+  const icon = $derived(
+    link ? "link" : item.kind === "image" ? "image" : item.kind === "file" ? "folder" : item.saved ? "snippet" : "text",
   );
   const itemTags = $derived(tags.filter((t) => item.tags.includes(t.id)));
   const initials = $derived((item.source_name ?? "?").slice(0, 2).toUpperCase());
   let iconFailed = $state(false);
-  const actionTitle = $derived(item.kind === "image" ? "文字起こし" : "翻訳");
+  const actionTitle = $derived(item.kind === "image" ? "文字起こし" : link ? "ブラウザで開く" : "翻訳");
 </script>
 
 <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -89,16 +111,13 @@
       {#if translated}
         <span class="check"><Icon name="check" size={11} /></span>
       {:else}
-        <Icon name={item.snippet ? "snippet" : item.kind === "image" ? "image" : "text"} size={14} />
+        <Icon name={icon} size={14} />
       {/if}
       <span class="label">{label}</span>
     </span>
     <span class="right">
-      {#if item.favorite}<span class="star"><Icon name="star-fill" size={13} /></span>{/if}
-      {#each itemTags.slice(0, 2) as t (t.id)}
-        <span class="chip"><i style:background={t.color}></i>{t.name}</span>
-      {/each}
-      {#if itemTags.length > 2}<span class="chip">+{itemTags.length - 2}</span>{/if}
+      {#if item.keyword}<span class="kw" title="短い名前">{item.keyword}</span>{/if}
+      {#if item.saved}<span class="star" title="保存済み"><Icon name="star-fill" size={13} /></span>{/if}
       {#if translated}
         <button class="ghost" title="元の文に戻す" onclick={(e) => { e.stopPropagation(); onrevert(); }}>
           <Icon name="globe" size={14} />
@@ -111,6 +130,23 @@
   <div class="body">
     {#if item.kind === "image"}
       <img src={fileSrc(item.thumb_path)} alt="" loading="lazy" draggable="false" />
+    {:else if item.kind === "file"}
+      <div class="files" class:missing={item.missing}>
+        {#if item.thumb_path}
+          <img class="ficon" src={fileSrc(item.thumb_path)} alt="" draggable="false" />
+        {:else}
+          <span class="ficon generic"><Icon name="folder" size={30} /></span>
+        {/if}
+        <ul>
+          {#each files.slice(0, 4) as f, n (n)}<li>{f}</li>{/each}
+          {#if files.length > 4}<li class="more">ほか {files.length - 4} 個</li>{/if}
+        </ul>
+      </div>
+    {:else if url}
+      <div class="url">
+        <b>{url.host}</b>
+        {#if url.rest}<span>{url.rest}</span>{/if}
+      </div>
     {:else}
       <p>{translated ? shownTranslation : item.preview}</p>
     {/if}
@@ -128,21 +164,31 @@
         <span class="badge">{initials}</span>
       {/if}
       <span class="meta">
-        {item.snippet ? "定型文" : timeAgo(item.used_at, now)}
+        {item.saved ? (item.use_count ? `${item.use_count}回使用` : "未使用") : timeAgo(item.used_at, now)}
         {#if item.kind === "image" && item.width}· {item.width}×{item.height}{/if}
         {#if item.kind === "text" && item.char_count > 0 && !translated}· {item.char_count}字{/if}
+        {#if item.kind === "file" && item.missing}· <b class="warn">見つかりません</b>{/if}
       </span>
     </span>
-    {#if !translated}
-      <button
-        class="action"
-        class:spin={busy}
-        title={actionTitle}
-        onclick={(e) => { e.stopPropagation(); onaction(); }}
-      >
-        <Icon name={busy ? "loader" : item.kind === "image" ? "scan" : "globe"} size={15} />
-      </button>
-    {/if}
+    <span class="end">
+      {#if itemTags.length}
+        <span class="tags" title={itemTags.map((t) => t.name).join("、")}>
+          {#each itemTags.slice(0, 3) as t (t.id)}<i style:background={t.color}></i>{/each}
+          {#if itemTags.length === 1}<span class="tname">{itemTags[0].name}</span>{/if}
+          {#if itemTags.length > 3}<span class="tname">+{itemTags.length - 3}</span>{/if}
+        </span>
+      {/if}
+      {#if !translated && item.kind !== "file"}
+        <button
+          class="action"
+          class:spin={busy}
+          title={actionTitle}
+          onclick={(e) => { e.stopPropagation(); onaction(); }}
+        >
+          <Icon name={busy ? "loader" : item.kind === "image" ? "scan" : link ? "external" : "globe"} size={15} />
+        </button>
+      {/if}
+    </span>
   </footer>
 </div>
 
@@ -173,14 +219,14 @@
   .card.dimmed { opacity: 0.5; filter: saturate(0.6); }
   .card.dimmed:hover { opacity: 0.8; }
   .card.selected {
-    outline: 3px solid var(--ring);
-    box-shadow: 0 0 0 6px color-mix(in srgb, var(--ring) 28%, transparent), 0 10px 24px rgba(0, 0, 0, 0.3);
+    outline: 2.5px solid var(--ring);
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28);
   }
-  /* いま操作しているカード（矢印キーの位置）は浮き上がらせる */
+  /* いま操作しているカード（矢印キーの位置）は少しだけ浮かせる */
   .card.focused {
-    transform: translateY(-6px);
-    outline: 3px solid var(--ring);
-    box-shadow: 0 0 0 6px color-mix(in srgb, var(--ring) 35%, transparent), 0 16px 30px rgba(0, 0, 0, 0.38);
+    transform: translateY(-4px);
+    outline: 2.5px solid var(--ring);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--ring) 22%, transparent), 0 12px 24px rgba(0, 0, 0, 0.32);
   }
   .card.focused:not(.selected) { outline-style: dashed; }
 
@@ -212,7 +258,29 @@
   }
 
   .image { --head: var(--orange); --tint: #fff6ee; }
-  .snippet { --head: var(--green); --tint: #eefaf4; }
+  .file { --head: var(--purple); --tint: #f4f0ff; }
+  .link { --head: var(--cyan); --tint: #ecfaff; }
+  .link .action { background: #0e9ab8; }
+  .url { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .url b { font-size: 15px; font-weight: 800; color: #0b7894; overflow-wrap: anywhere; }
+  .url span {
+    font-size: 12px; line-height: 1.45; opacity: 0.7; overflow-wrap: anywhere;
+    display: -webkit-box; -webkit-line-clamp: calc(var(--lines, 6) - 1); line-clamp: calc(var(--lines, 6) - 1);
+    -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .end { display: flex; align-items: center; gap: 6px; flex: none; }
+  .tags { display: flex; align-items: center; gap: 3px; max-width: 96px; }
+  .tags i { width: 8px; height: 8px; border-radius: 50%; flex: none; box-shadow: 0 0 0 1.5px var(--tint); }
+  .tname { font-size: 11px; font-weight: 600; opacity: 0.7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .files { height: 100%; display: flex; gap: 10px; align-items: flex-start; }
+  .files.missing { opacity: 0.5; }
+  .ficon { width: 44px; height: 44px; flex: none; object-fit: contain; }
+  .ficon.generic { display: grid; place-items: center; color: #7a55f0; }
+  .files ul { margin: 0; padding: 0; list-style: none; min-width: 0; font-size: 12.5px; line-height: 1.55; }
+  .files li { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .files li.more { opacity: 0.6; }
+  .warn { color: #dc2626; font-weight: 700; }
+  .saved { --head: var(--green); --tint: #eefaf4; }
   .translated { --head: #2f2a63; --tint: #1e1b3d; --ink: #f1efff; }
 
   header {
@@ -233,14 +301,6 @@
   .check { display: grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; background: #22c55e; color: #fff; }
   .right { display: flex; align-items: center; gap: 4px; flex: none; }
   .star { color: #ffd84d; display: flex; }
-  .chip {
-    display: inline-flex; align-items: center; gap: 4px;
-    padding: 2px 7px; border-radius: 999px;
-    background: rgba(255, 255, 255, 0.92); color: #333;
-    font-size: 11px; font-weight: 600; max-width: 76px;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .chip i { width: 7px; height: 7px; border-radius: 50%; flex: none; }
   kbd {
     font: 600 10px/1 var(--mono);
     color: rgba(255, 255, 255, 0.75);
@@ -258,12 +318,12 @@
     white-space: pre-wrap;
     word-break: break-word;
     display: -webkit-box;
-    -webkit-line-clamp: 6;
-    line-clamp: 6;
+    -webkit-line-clamp: var(--lines, 6);
+    line-clamp: var(--lines, 6);
     -webkit-box-orient: vertical;
     overflow: hidden;
   }
-  .body img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .body > img { width: 100%; height: 100%; object-fit: contain; display: block; }
 
   footer {
     height: 36px; flex: none;

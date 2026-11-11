@@ -12,7 +12,7 @@ pub fn now_ms() -> i64 {
 #[derive(Debug, Clone, Serialize)]
 pub struct Item {
     pub id: i64,
-    pub kind: String, // "text" | "image"
+    pub kind: String, // "text" | "image" | "file"
     /// 表示用プレビュー（長文は切り詰め）
     pub preview: String,
     pub char_count: i64,
@@ -25,9 +25,14 @@ pub struct Item {
     pub source_icon: Option<String>,
     pub created_at: i64,
     pub used_at: i64,
-    pub favorite: bool,
-    pub snippet: bool,
+    /// 「保存」に入っているか（履歴の上限で消えず、履歴一覧には出ない）
+    pub saved: bool,
     pub title: Option<String>,
+    /// 呼び出し用の短い名前（検索でいちばん上に出る）
+    pub keyword: Option<String>,
+    pub use_count: i64,
+    /// ファイルカードで、元のファイルが見つからないものがある
+    pub missing: bool,
     /// 翻訳済みならその訳文
     pub translated: Option<String>,
     pub tags: Vec<i64>,
@@ -50,9 +55,12 @@ pub struct SourceApp {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Filter {
-    /// "all" | "favorite" | "snippet" | "tag"
+    /// "history" | "saved"
     pub tab: String,
+    /// 保存タブをタグで絞り込む
     pub tag_id: Option<i64>,
+    /// 種類: "text" | "link" | "image" | "file"
+    pub kind: Option<String>,
     pub source_id: Option<String>,
     pub query: Option<String>,
     pub limit: Option<i64>,
@@ -73,6 +81,57 @@ pub struct NewItem<'a> {
     pub source_name: Option<&'a str>,
     pub source_id: Option<&'a str>,
     pub source_icon: Option<&'a str>,
+}
+
+pub fn fnv1a(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}{:x}", bytes.len())
+}
+
+/// URL だけのテキスト（リンク）
+const LINK_COND: &str = "(kind = 'text' AND (trim(text) LIKE 'http://_%' OR trim(text) LIKE 'https://_%') AND instr(trim(text), ' ') = 0 \
+     AND instr(trim(text), char(10)) = 0 AND instr(trim(text), char(9)) = 0)";
+
+/// 検索欄の /画像 などを種類に読み替える
+fn kind_word(w: &str) -> Option<&'static str> {
+    let k = w.strip_prefix(['/', '／'])?.to_lowercase();
+    Some(match k.as_str() {
+        "テキスト" | "text" | "文字" => "text",
+        "リンク" | "link" | "url" => "link",
+        "画像" | "image" | "img" => "image",
+        "ファイル" | "file" => "file",
+        _ => return None,
+    })
+}
+
+/// 書き出し・読み込み用の保存アイテム（テキストとリンクだけ）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportItem {
+    pub text: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub keyword: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub use_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportFile {
+    pub app: String,
+    pub version: u32,
+    pub tags: Vec<Tag>,
+    pub items: Vec<ExportItem>,
+}
+
+pub fn text_hash(text: &str) -> String {
+    format!("t:{}", fnv1a(text.as_bytes()))
 }
 
 pub struct Db {
@@ -121,17 +180,60 @@ impl Db {
         )?;
         // v0.1 以降に追加した列（既にあればエラーになるので無視）
         let _ = conn.execute("ALTER TABLE items ADD COLUMN translated TEXT", []);
-        Ok(Self { conn })
+        let _ = conn.execute("ALTER TABLE items ADD COLUMN keyword TEXT", []);
+        let _ = conn.execute("ALTER TABLE items ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0", []);
+        let db = Self { conn };
+        db.migrate()?;
+        Ok(db)
+    }
+
+    /// v0.2: お気に入り・定型文・タグ付きを「保存」(favorite 列) にまとめる
+    fn migrate(&self) -> rusqlite::Result<()> {
+        let ver: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if ver >= 1 {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE items SET favorite = 1
+             WHERE snippet = 1 OR id IN (SELECT item_id FROM item_tags)",
+            [],
+        )?;
+        // 定型文の hash を本文から作り直し、コピーと同じ内容として見分けられるようにする
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare("SELECT id, text FROM items WHERE hash LIKE 'snippet:%' AND text IS NOT NULL")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        for (id, text) in rows {
+            let h = text_hash(&text);
+            tx.execute("DELETE FROM items WHERE hash = ?1 AND favorite = 0", [&h])?;
+            // 同じ本文が別に保存済みなら、古い hash のまま残す
+            let _ = tx.execute("UPDATE items SET hash = ?1 WHERE id = ?2", params![h, id]);
+        }
+        tx.execute("PRAGMA user_version = 1", [])?;
+        tx.commit()
     }
 
     /// 新規追加。同じ内容が既にあれば先頭へ移動（コピー元は最新で上書き）して false を返す
     pub fn insert_or_bump(&self, it: &NewItem) -> rusqlite::Result<(i64, bool)> {
         let now = now_ms();
-        let existing: Option<i64> = self
+        // 保存済みと同じ内容は履歴に出さない（保存側もそのまま）
+        if let Some(t) = it.text {
+            if self.is_saved_text(t)? {
+                return Ok((0, false));
+            }
+        }
+        let existing: Option<(i64, bool)> = self
             .conn
-            .query_row("SELECT id FROM items WHERE hash = ?1", [it.hash], |r| r.get(0))
+            .query_row("SELECT id, favorite FROM items WHERE hash = ?1", [it.hash], |r| {
+                Ok((r.get(0)?, r.get::<_, i64>(1)? != 0))
+            })
             .optional()?;
-        if let Some(id) = existing {
+        if let Some((id, true)) = existing {
+            return Ok((id, false));
+        }
+        if let Some((id, _)) = existing {
             self.conn.execute(
                 "UPDATE items SET used_at = ?1,
                     source_name = COALESCE(?2, source_name),
@@ -159,7 +261,10 @@ impl Db {
         let (preview, char_count) = match &text {
             Some(t) => {
                 let count = t.chars().count();
-                (t.chars().take(PREVIEW_CHARS).collect(), count as i64)
+                // ファイルカードはパスの一覧なので切り詰めない（個数を正しく出すため）
+                let kind: String = r.get("kind")?;
+                let preview = if kind == "file" { t.clone() } else { t.chars().take(PREVIEW_CHARS).collect() };
+                (preview, count as i64)
             }
             None => (String::new(), 0),
         };
@@ -177,9 +282,11 @@ impl Db {
             source_icon: r.get("source_icon")?,
             created_at: r.get("created_at")?,
             used_at: r.get("used_at")?,
-            favorite: r.get::<_, i64>("favorite")? != 0,
-            snippet: r.get::<_, i64>("snippet")? != 0,
+            saved: r.get::<_, i64>("favorite")? != 0,
             title: r.get("title")?,
+            keyword: r.get("keyword")?,
+            use_count: r.get("use_count")?,
+            missing: false,
             translated: r.get("translated")?,
             tags: vec![],
         })
@@ -188,14 +295,15 @@ impl Db {
     pub fn list(&self, f: &Filter) -> rusqlite::Result<Vec<Item>> {
         let mut sql = String::from("SELECT * FROM items i WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![];
-        match f.tab.as_str() {
-            "favorite" => sql.push_str(" AND favorite = 1"),
-            "snippet" => sql.push_str(" AND snippet = 1"),
-            "tag" => {
+        let saved = f.tab == "saved";
+        if saved {
+            sql.push_str(" AND favorite = 1");
+            if let Some(tag) = f.tag_id {
                 sql.push_str(" AND EXISTS (SELECT 1 FROM item_tags t WHERE t.item_id = i.id AND t.tag_id = ?)");
-                args.push(Box::new(f.tag_id.unwrap_or(-1)));
+                args.push(Box::new(tag));
             }
-            _ => sql.push_str(" AND snippet = 0"),
+        } else {
+            sql.push_str(" AND favorite = 0");
         }
         if let Some(since) = f.since {
             sql.push_str(" AND used_at >= ?");
@@ -209,22 +317,50 @@ impl Db {
             sql.push_str(" AND source_id = ?");
             args.push(Box::new(src.clone()));
         }
-        if let Some(q) = f.query.as_ref().map(|q| q.trim()).filter(|q| !q.is_empty()) {
-            for word in q.split_whitespace() {
-                sql.push_str(" AND (text LIKE ? ESCAPE '\\' OR translated LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\' OR source_name LIKE ? ESCAPE '\\')");
-                let esc = word.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-                let pat = format!("%{esc}%");
-                for _ in 0..3 {
-                    args.push(Box::new(pat.clone()));
-                }
-                args.push(Box::new(pat));
+        // 種類（ボタン or 検索欄の /画像 など）
+        let mut kinds: Vec<String> = f.kind.iter().cloned().collect();
+        if let Some(q) = f.query.as_deref() {
+            kinds.extend(q.split_whitespace().filter_map(|w| kind_word(w)).map(String::from));
+        }
+        for k in kinds {
+            match k.as_str() {
+                "link" => sql.push_str(&format!(" AND {LINK_COND}")),
+                "text" => sql.push_str(&format!(" AND kind = 'text' AND NOT {LINK_COND}")),
+                "image" => sql.push_str(" AND kind = 'image'"),
+                "file" => sql.push_str(" AND kind = 'file'"),
+                _ => {}
             }
         }
-        if f.tab == "snippet" {
-            sql.push_str(" ORDER BY COALESCE(title, text) COLLATE NOCASE");
-        } else {
-            sql.push_str(" ORDER BY used_at DESC");
+        let query = f.query.as_ref().map(|q| q.trim()).filter(|q| !q.is_empty());
+        if let Some(q) = query {
+            for word in q.split_whitespace() {
+                // #名前 はタグの名前（前方一致）で絞り込む
+                if let Some(tag) = word.strip_prefix(['#', '＃']).filter(|t| !t.is_empty()) {
+                    let esc = tag.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+                    sql.push_str(" AND EXISTS (SELECT 1 FROM item_tags it JOIN tags tg ON tg.id = it.tag_id WHERE it.item_id = i.id AND tg.name LIKE ? ESCAPE '\\')");
+                    args.push(Box::new(format!("{esc}%")));
+                    continue;
+                }
+                if word == "#" || word == "＃" || word.starts_with(['/', '／']) {
+                    continue;
+                }
+                sql.push_str(" AND (text LIKE ? ESCAPE '\\' OR translated LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\' OR keyword LIKE ? ESCAPE '\\' OR source_name LIKE ? ESCAPE '\\')");
+                let esc = word.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+                let pat = format!("%{esc}%");
+                for _ in 0..5 {
+                    args.push(Box::new(pat.clone()));
+                }
+            }
         }
+        sql.push_str(" ORDER BY ");
+        if let Some(q) = query {
+            // 短い名前がぴったり一致したもの → 前方一致したもの を先頭に
+            let esc = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            sql.push_str("(keyword = ? COLLATE NOCASE) DESC, (keyword LIKE ? ESCAPE '\\') DESC, ");
+            args.push(Box::new(q.to_string()));
+            args.push(Box::new(format!("{esc}%")));
+        }
+        sql.push_str(if saved { "use_count DESC, used_at DESC" } else { "used_at DESC" });
         sql.push_str(" LIMIT ?");
         args.push(Box::new(f.limit.unwrap_or(300)));
 
@@ -268,15 +404,31 @@ impl Db {
             .optional()
     }
 
+    pub fn is_saved(&self, id: i64) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT favorite FROM items WHERE id = ?1", [id], |r| r.get::<_, i64>(0))
+            .optional()?
+            == Some(1))
+    }
+
+    /// 貼り付けた: 履歴は先頭へ、保存は使用回数を増やす
     pub fn touch(&self, id: i64) -> rusqlite::Result<()> {
-        self.conn
-            .execute("UPDATE items SET used_at = ?1 WHERE id = ?2 AND snippet = 0", params![now_ms(), id])?;
+        self.conn.execute(
+            "UPDATE items SET used_at = ?1, use_count = use_count + 1 WHERE id = ?2",
+            params![now_ms(), id],
+        )?;
         Ok(())
     }
 
-    pub fn set_favorite(&self, id: i64, fav: bool) -> rusqlite::Result<()> {
-        self.conn
-            .execute("UPDATE items SET favorite = ?1 WHERE id = ?2", params![fav as i64, id])?;
+    /// 保存する / 保存を外す（外したものは履歴の先頭に戻す）
+    pub fn set_saved(&self, id: i64, saved: bool) -> rusqlite::Result<()> {
+        if saved {
+            self.conn.execute("UPDATE items SET favorite = 1 WHERE id = ?1", [id])?;
+        } else {
+            self.conn
+                .execute("UPDATE items SET favorite = 0, used_at = ?1 WHERE id = ?2", params![now_ms(), id])?;
+        }
         Ok(())
     }
 
@@ -303,9 +455,9 @@ impl Db {
         Ok(out)
     }
 
-    const PRUNABLE: &'static str = "favorite = 0 AND snippet = 0";
+    const PRUNABLE: &'static str = "favorite = 0";
 
-    /// 上限を超えた古い履歴を削除（お気に入り・定型文は対象外）
+    /// 上限を超えた古い履歴を削除（保存したものは対象外）
     pub fn prune(&self, max: u32) -> rusqlite::Result<Vec<String>> {
         let cond = format!(
             "id IN (SELECT id FROM items WHERE {} ORDER BY used_at DESC LIMIT -1 OFFSET {})",
@@ -324,22 +476,145 @@ impl Db {
         Ok(files)
     }
 
-    pub fn save_snippet(&self, id: Option<i64>, title: &str, text: &str) -> rusqlite::Result<i64> {
+    /// 保存済みのテキストと同じ内容か
+    pub fn is_saved_text(&self, text: &str) -> rusqlite::Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM items WHERE favorite = 1 AND kind = 'text' AND text = ?1 LIMIT 1",
+                [text],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// 保存の追加・編集。id があればそのカード（履歴でも）を保存に入れて書き換える。
+    /// text は画像なら None。同じ本文が別に保存済みなら Ok(None)
+    pub fn save_item(
+        &self,
+        id: Option<i64>,
+        title: &str,
+        keyword: &str,
+        text: Option<&str>,
+    ) -> rusqlite::Result<Option<i64>> {
         let now = now_ms();
-        let title = Some(title.trim()).filter(|t| !t.is_empty());
+        let norm = |s: &str| Some(s.trim().to_string()).filter(|t| !t.is_empty());
+        let (title, keyword) = (norm(title), norm(keyword));
+        let Some(text) = text else {
+            let Some(id) = id else { return Ok(None) };
+            self.conn.execute(
+                "UPDATE items SET favorite = 1, title = ?1, keyword = ?2 WHERE id = ?3",
+                params![title, keyword, id],
+            )?;
+            return Ok(Some(id));
+        };
+        let hash = text_hash(text);
+        let dup: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM items WHERE favorite = 1 AND (hash = ?1 OR (kind = 'text' AND text = ?2)) AND id IS NOT ?3",
+                params![hash, text, id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if dup.is_some() {
+            return Ok(None);
+        }
+        // 同じ内容の履歴は保存と重なるので消す
+        self.conn.execute(
+            "DELETE FROM items WHERE hash = ?1 AND favorite = 0 AND id IS NOT ?2",
+            params![hash, id],
+        )?;
         if let Some(id) = id {
             self.conn.execute(
-                "UPDATE items SET title = ?1, text = ?2 WHERE id = ?3 AND snippet = 1",
-                params![title, text, id],
+                "UPDATE items SET favorite = 1, title = ?1, keyword = ?2, hash = ?3,
+                    translated = CASE WHEN text = ?4 THEN translated ELSE NULL END,
+                    text = ?4
+                 WHERE id = ?5",
+                params![title, keyword, hash, text, id],
             )?;
-            return Ok(id);
+            return Ok(Some(id));
         }
         self.conn.execute(
-            "INSERT INTO items (kind, text, hash, source_name, source_id, created_at, used_at, snippet, title)
-             VALUES ('text', ?1, ?2, '定型文', 'clipo.snippet', ?3, ?3, 1, ?4)",
-            params![text, format!("snippet:{now}:{}", text.len()), now, title],
+            "INSERT INTO items (kind, text, hash, source_name, source_id, created_at, used_at, favorite, title, keyword)
+             VALUES ('text', ?1, ?2, '自分で作成', 'clipo.saved', ?3, ?3, 1, ?4, ?5)",
+            params![text, hash, now, title, keyword],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(Some(self.conn.last_insert_rowid()))
+    }
+
+    /// 保存したテキストを書き出す（画像・ファイルは端末ごとに違うので含めない）
+    pub fn export_saved(&self) -> rusqlite::Result<ExportFile> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, text, title, keyword, use_count FROM items
+             WHERE favorite = 1 AND kind = 'text' AND text IS NOT NULL ORDER BY use_count DESC, used_at DESC",
+        )?;
+        let rows: Vec<(i64, ExportItem)> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    ExportItem { text: r.get(1)?, title: r.get(2)?, keyword: r.get(3)?, tags: vec![], use_count: r.get(4)? },
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        let mut tag_stmt = self
+            .conn
+            .prepare("SELECT t.name FROM item_tags it JOIN tags t ON t.id = it.tag_id WHERE it.item_id = ?1")?;
+        let mut items = vec![];
+        for (id, mut it) in rows {
+            it.tags = tag_stmt.query_map([id], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            items.push(it);
+        }
+        Ok(ExportFile { app: "Clipo".into(), version: 1, tags: self.list_tags()?, items })
+    }
+
+    /// 読み込む。同じ本文がすでに保存済みならタイトルなどを補うだけ。(追加, 更新) の件数を返す
+    pub fn import_saved(&self, f: &ExportFile) -> rusqlite::Result<(usize, usize)> {
+        let tx = self.conn.unchecked_transaction()?;
+        for t in &f.tags {
+            tx.execute("INSERT OR IGNORE INTO tags (name, color) VALUES (?1, ?2)", params![t.name.trim(), t.color])?;
+        }
+        let (mut added, mut updated) = (0, 0);
+        for it in &f.items {
+            if it.text.is_empty() {
+                continue;
+            }
+            let hash = text_hash(&it.text);
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM items WHERE hash = ?1 OR (kind = 'text' AND text = ?2)",
+                    params![hash, it.text],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let id = if let Some(id) = existing {
+                tx.execute(
+                    "UPDATE items SET favorite = 1, title = COALESCE(title, ?1), keyword = COALESCE(keyword, ?2),
+                        use_count = MAX(use_count, ?3) WHERE id = ?4",
+                    params![it.title, it.keyword, it.use_count, id],
+                )?;
+                updated += 1;
+                id
+            } else {
+                let now = now_ms();
+                tx.execute(
+                    "INSERT INTO items (kind, text, hash, source_name, source_id, created_at, used_at, favorite, title, keyword, use_count)
+                     VALUES ('text', ?1, ?2, '読み込み', 'clipo.saved', ?3, ?3, 1, ?4, ?5, ?6)",
+                    params![it.text, hash, now, it.title, it.keyword, it.use_count],
+                )?;
+                added += 1;
+                tx.last_insert_rowid()
+            };
+            for name in &it.tags {
+                tx.execute(
+                    "INSERT OR IGNORE INTO item_tags (item_id, tag_id) SELECT ?1, id FROM tags WHERE name = ?2",
+                    params![id, name.trim()],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok((added, updated))
     }
 
     pub fn list_tags(&self) -> rusqlite::Result<Vec<Tag>> {
@@ -380,6 +655,7 @@ impl Db {
             params![item_id, tag_id],
         )?;
         if removed == 0 {
+            self.conn.execute("UPDATE items SET favorite = 1 WHERE id = ?1", [item_id])?;
             self.conn.execute(
                 "INSERT INTO item_tags (item_id, tag_id) VALUES (?1, ?2)",
                 params![item_id, tag_id],
@@ -389,9 +665,11 @@ impl Db {
         Ok(false)
     }
 
-    /// タグを付ける(on=true)/外す(on=false)。何度呼んでも同じ結果になる
+    /// タグを付ける(on=true)/外す(on=false)。何度呼んでも同じ結果になる。
+    /// タグは保存の中の分類なので、付けたカードは保存に入る
     pub fn set_tag(&self, item_id: i64, tag_id: i64, on: bool) -> rusqlite::Result<()> {
         if on {
+            self.conn.execute("UPDATE items SET favorite = 1 WHERE id = ?1", [item_id])?;
             self.conn.execute(
                 "INSERT OR IGNORE INTO item_tags (item_id, tag_id) VALUES (?1, ?2)",
                 params![item_id, tag_id],
@@ -408,7 +686,7 @@ impl Db {
     pub fn source_apps(&self) -> rusqlite::Result<Vec<SourceApp>> {
         let mut stmt = self.conn.prepare(
             "SELECT source_id, MAX(source_name), MAX(source_icon), COUNT(*) FROM items
-             WHERE source_id IS NOT NULL AND snippet = 0
+             WHERE source_id IS NOT NULL AND favorite = 0
              GROUP BY source_id ORDER BY COUNT(*) DESC",
         )?;
         stmt.query_map([], |r| {
