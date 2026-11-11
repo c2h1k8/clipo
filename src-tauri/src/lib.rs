@@ -752,8 +752,10 @@ fn hide_panel(app: AppHandle) {
     platform::activate_target();
 }
 
+// Windows ではウィンドウ生成を同期コマンド内で行うと WebView2 がデッドロックし
+// 真っ白なまま固まるため、async コマンドにする (tauri-apps/wry#583)
 #[tauri::command]
-fn open_settings(app: AppHandle) {
+async fn open_settings(app: AppHandle) {
     open_settings_window(&app);
 }
 
@@ -865,7 +867,11 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             "open" => show_panel(app),
             "shot" => start_screenshot(app),
             "ocr" => start_ocr(app),
-            "settings" => open_settings_window(app),
+            // メニューイベントハンドラ内での生成も Windows でデッドロックするので別スレッドで行う
+            "settings" => {
+                let app = app.clone();
+                std::thread::spawn(move || open_settings_window(&app));
+            }
             "quit" => app.exit(0),
             _ => {}
         })
