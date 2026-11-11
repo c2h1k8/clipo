@@ -20,6 +20,17 @@
     return KEYMAP[code] ?? null;
   }
 
+  // 修飾キーだけの 2 回押し（例: Ctrl を素早く 2 回）の検出
+  const MOD_CODES: Record<string, string> = {
+    ControlLeft: "Control", ControlRight: "Control",
+    ShiftLeft: "Shift", ShiftRight: "Shift",
+    AltLeft: "Alt", AltRight: "Alt",
+    // Windows キーはスタートメニューが開くので Mac の ⌘ のみ
+    ...(isMac ? { MetaLeft: "Command", MetaRight: "Command" } : {}),
+  };
+  let held: { mod: string; at: number; clean: boolean } | null = null;
+  let lastTap: { mod: string; at: number } | null = null;
+
   async function start(e: MouseEvent) {
     e.stopPropagation();
     if (disabled || recording) return;
@@ -31,13 +42,18 @@
   // 記録中はウィンドウ全体でキーを受け取る
   $effect(() => {
     if (!recording) return;
+    held = null;
+    lastTap = null;
     const onKey = (e: KeyboardEvent) => onKeydown(e);
+    const onUp = (e: KeyboardEvent) => onKeyup(e);
     const onClickOutside = () => stop();
     window.addEventListener("keydown", onKey, true);
+    window.addEventListener("keyup", onUp, true);
     window.addEventListener("click", onClickOutside);
     window.addEventListener("blur", onClickOutside);
     return () => {
       window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("keyup", onUp, true);
       window.removeEventListener("click", onClickOutside);
       window.removeEventListener("blur", onClickOutside);
     };
@@ -53,6 +69,19 @@
     if (!recording) return;
     e.preventDefault();
     e.stopPropagation();
+    const mod = MOD_CODES[e.code];
+    if (mod) {
+      if (e.repeat) return;
+      if (held) {
+        held.clean = false; // 修飾キーの同時押し
+        lastTap = null;
+      } else {
+        held = { mod, at: performance.now(), clean: true };
+      }
+      return;
+    }
+    if (held) held.clean = false;
+    lastTap = null;
     if (e.key === "Escape") return stop();
     if ((e.key === "Backspace" || e.key === "Delete") && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
       value = "";
@@ -73,6 +102,30 @@
     if (!mods.length && !/^F\d+$/.test(key)) return; // 修飾キーなしは F キーのみ許可
     value = [...mods, key].join("+");
     stop();
+  }
+
+  function onKeyup(e: KeyboardEvent) {
+    if (!recording) return;
+    const mod = MOD_CODES[e.code];
+    if (!mod || !held || held.mod !== mod) {
+      if (!mod) return;
+      held = null;
+      return;
+    }
+    e.preventDefault();
+    const now = performance.now();
+    const tap = held.clean && now - held.at < 350;
+    held = null;
+    if (!tap) {
+      lastTap = null;
+      return;
+    }
+    if (lastTap && lastTap.mod === mod && now - lastTap.at < 500) {
+      value = `DoubleTap+${mod}`;
+      stop();
+    } else {
+      lastTap = { mod, at: now };
+    }
   }
 </script>
 

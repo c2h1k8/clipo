@@ -235,13 +235,61 @@ fn tidy_cjk(s: &str) -> String {
     out
 }
 
+/// 日本語の OCR エンジンを優先して作る（無ければユーザーの言語設定から）
+fn ocr_engine() -> Result<windows::Media::Ocr::OcrEngine, String> {
+    use windows::core::HSTRING;
+    use windows::Globalization::Language;
+    use windows::Media::Ocr::OcrEngine;
+    if let Ok(ja) = Language::CreateLanguage(&HSTRING::from("ja")) {
+        if OcrEngine::IsLanguageSupported(&ja).unwrap_or(false) {
+            if let Ok(engine) = OcrEngine::TryCreateFromLanguage(&ja) {
+                return Ok(engine);
+            }
+        }
+    }
+    OcrEngine::TryCreateFromUserProfileLanguages().map_err(|_| {
+        "OCR が使えません。Windows の「設定 → 時刻と言語 → 言語」で日本語を追加し、\
+         「光学式文字認識」をインストールしてください"
+            .to_string()
+    })
+}
+
 fn ocr_rgba(w: u32, h: u32, rgba: &[u8]) -> Result<String, String> {
+    use image::imageops::FilterType;
     use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
     use windows::Media::Ocr::OcrEngine;
     use windows::Storage::Streams::DataWriter;
     let e = |err: windows::core::Error| err.message().to_string();
 
-    let mut bgra = rgba.to_vec();
+    let mut img = image::RgbaImage::from_raw(w, h, rgba.to_vec()).ok_or("画像を読めませんでした")?;
+    // クリップボードの画像はアルファが 0（透明）のことがあり、そのままだと真っ黒扱いで何も読めない。
+    // 透明部分は白として不透明にする
+    let all_clear = img.pixels().all(|p| p[3] == 0);
+    for p in img.pixels_mut() {
+        if all_clear {
+            p[3] = 255;
+        } else if p[3] < 255 {
+            let a = p[3] as u32;
+            for c in 0..3 {
+                p[c] = ((p[c] as u32 * a + 255 * (255 - a)) / 255) as u8;
+            }
+            p[3] = 255;
+        }
+    }
+    // Windows OCR は小さい文字が苦手なので、小さい画像は拡大してから読む
+    let max_dim = OcrEngine::MaxImageDimension().unwrap_or(10_000).max(1);
+    let longest = w.max(h).max(1);
+    let scale = if longest < 1600 { (1600 / longest).clamp(1, 3) } else { 1 };
+    let scale = scale.min(max_dim / longest).max(1);
+    if scale > 1 {
+        img = image::imageops::resize(&img, w * scale, h * scale, FilterType::CatmullRom);
+    } else if longest > max_dim {
+        let f = max_dim as f64 / longest as f64;
+        img = image::imageops::resize(&img, (w as f64 * f) as u32, (h as f64 * f) as u32, FilterType::Triangle);
+    }
+    let (w, h) = img.dimensions();
+
+    let mut bgra = img.into_raw();
     for px in bgra.chunks_exact_mut(4) {
         px.swap(0, 2);
     }
@@ -256,8 +304,7 @@ fn ocr_rgba(w: u32, h: u32, rgba: &[u8]) -> Result<String, String> {
         BitmapAlphaMode::Premultiplied,
     )
     .map_err(e)?;
-    let engine = OcrEngine::TryCreateFromUserProfileLanguages()
-        .map_err(|_| "OCR が使えません。Windows の設定で日本語の言語パックを追加してください".to_string())?;
+    let engine = ocr_engine()?;
     let result = engine.RecognizeAsync(&bitmap).map_err(e)?.join().map_err(e)?;
     let mut lines = vec![];
     for line in result.Lines().map_err(e)? {
@@ -298,4 +345,52 @@ pub fn screenshot_dir() -> Option<std::path::PathBuf> {
 
 pub fn screenshot_prefixes() -> Vec<String> {
     vec![]
+}
+
+/// 修飾キーの 2 回押し検出用に、キーボードの低レベルフックを専用スレッドで動かす
+pub fn start_modifier_watch() {
+    use crate::taps::{self, Mod};
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, GetMessageW, SetWindowsHookExW, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL,
+        WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    };
+
+    unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        unsafe {
+            if code >= 0 {
+                let k = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+                // 貼り付けなどで合成されたキー入力は数えない
+                if (k.flags.0 & LLKHF_INJECTED.0) == 0 {
+                    let m = match k.vkCode {
+                        0xA0 | 0xA1 | 0x10 => Some(Mod::Shift),
+                        0xA2 | 0xA3 | 0x11 => Some(Mod::Control),
+                        0xA4 | 0xA5 | 0x12 => Some(Mod::Alt),
+                        0x5B | 0x5C => Some(Mod::Command),
+                        _ => None,
+                    };
+                    let msg = wparam.0 as u32;
+                    let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+                    let is_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+                    match (m, is_down, is_up) {
+                        (Some(m), true, _) => taps::down(m),
+                        (Some(m), _, true) => taps::up(m),
+                        (None, true, _) => taps::other(),
+                        _ => {}
+                    }
+                }
+            }
+            CallNextHookEx(None, code, wparam, lparam)
+        }
+    }
+
+    std::thread::spawn(|| unsafe {
+        let Ok(_hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), None, 0) else {
+            log::warn!("keyboard hook failed");
+            return;
+        };
+        // フックはこのスレッドのメッセージループで呼ばれる
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+    });
 }

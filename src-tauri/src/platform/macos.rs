@@ -257,3 +257,41 @@ pub fn style_panel(win: &tauri::WebviewWindow) {
             .build(),
     );
 }
+
+/// 修飾キーの 2 回押し検出用に、キー入力を監視する（メインスレッドから呼ぶこと）。
+/// 他のアプリでの入力はアクセシビリティの許可があるときだけ届く
+pub fn start_modifier_watch() {
+    use crate::taps::{self, Mod};
+    use block2::RcBlock;
+    use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags, NSEventType};
+    use std::ptr::NonNull;
+
+    fn handle(ev: &NSEvent) {
+        let kind = ev.r#type();
+        if kind == NSEventType::KeyDown {
+            taps::other();
+            return;
+        }
+        if kind != NSEventType::FlagsChanged {
+            return;
+        }
+        let (m, flag) = match ev.keyCode() {
+            54 | 55 => (Mod::Command, NSEventModifierFlags::Command),
+            56 | 60 => (Mod::Shift, NSEventModifierFlags::Shift),
+            58 | 61 => (Mod::Alt, NSEventModifierFlags::Option),
+            59 | 62 => (Mod::Control, NSEventModifierFlags::Control),
+            _ => return,
+        };
+        if ev.modifierFlags().contains(flag) { taps::down(m) } else { taps::up(m) }
+    }
+
+    let mask = NSEventMask::FlagsChanged | NSEventMask::KeyDown;
+    let global = RcBlock::new(|ev: NonNull<NSEvent>| handle(unsafe { ev.as_ref() }));
+    let local = RcBlock::new(|ev: NonNull<NSEvent>| -> *mut NSEvent {
+        handle(unsafe { ev.as_ref() });
+        ev.as_ptr()
+    });
+    // 監視は終了まで続けるので、返り値のオブジェクトは解放しない
+    std::mem::forget(NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &global));
+    std::mem::forget(unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &local) });
+}

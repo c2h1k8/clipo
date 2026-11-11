@@ -127,7 +127,8 @@
         </div>
       {/if}
       <p class="help">
-        クリックしてキーを押すと登録されます。Esc で取り消し、Delete で未設定にできます。
+        クリックしてキーを押すと登録されます。{isMac ? "⌘ / ⌃ / ⌥ / ⇧" : "Ctrl / Shift / Alt"} を素早く2回押すと「2回押し」で登録できます。Esc で取り消し、Delete で未設定にできます。
+        {#if isMac}2回押しを他のアプリで使うにはアクセシビリティの許可が必要です。{/if}
         {#if !isMac}Screenpresso など他のスクショアプリを使う場合は、範囲スクショをオフにするか別のキーにしてください。{/if}
       </p>
     </section>
@@ -263,7 +264,9 @@
   section { margin-bottom: 18px; padding: 10px 14px; border-radius: 12px; background: var(--surface); border: 1px solid var(--line); }
   .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 42px; }
   .row + .row { border-top: 1px solid var(--line); }
-  .row > span { display: flex; flex-direction: column; font-size: 13.5px; }
+  .row > span { display: flex; flex-direction: column; font-size: 13.5px; min-width: 0; }
+  .row > :last-child:not(:first-child) { flex: none; }
+  button { white-space: nowrap; }
   small { font-size: 11.5px; color: var(--fg-dim); margin-top: 1px; }
   .help { margin: 6px 0 4px; font-size: 12px; line-height: 1.55; color: var(--fg-dim); }
   .check { display: flex; align-items: center; gap: 8px; font-size: 13.5px; }
@@ -297,8 +300,8 @@
     padding: 12px 24px; background: var(--bg); border-top: 1px solid var(--line);
   }
   footer .primary { height: 34px; padding: 0 22px; }
-  .seg { display: flex; border: 1px solid var(--line-strong); border-radius: 8px; overflow: hidden; }
-  .seg button { border: 0; border-radius: 0; height: 30px; padding: 0 14px; }
+  .seg { flex: none; display: flex; border: 1px solid var(--line-strong); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; height: 30px; padding: 0 14px; white-space: nowrap; }
   .seg button + button { border-left: 1px solid var(--line-strong); }
   .seg button.on { background: var(--accent); color: #fff; font-weight: 700; }
   .slider { display: flex !important; flex-direction: row !important; align-items: center; gap: 10px; }

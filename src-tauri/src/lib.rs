@@ -1,6 +1,7 @@
 mod db;
 mod platform;
 mod settings;
+mod taps;
 mod translate;
 
 use db::{now_ms, Db, Filter, Item, NewItem, SourceApp, Tag};
@@ -45,6 +46,8 @@ pub struct AppState {
     /// いま表示しているパネルの高さ（論理px, f64 のビット列）
     panel_height_now: std::sync::atomic::AtomicU64,
     shortcuts: Mutex<HashMap<u32, Action>>,
+    /// 修飾キーの 2 回押しで動く操作
+    double_taps: Mutex<HashMap<taps::Mod, Action>>,
 }
 
 type Res<T> = Result<T, String>;
@@ -352,7 +355,10 @@ fn start_ocr(app: &AppHandle) {
         state.pasting.store(true, Ordering::SeqCst);
         let tmp = std::env::temp_dir().join("clipo-ocr.png");
         let result = platform::capture_and_ocr(&tmp).and_then(|text| {
-            let Some(text) = text.filter(|t| !t.trim().is_empty()) else { return Ok(false) };
+            let Some(text) = text else { return Ok(false) };
+            if text.trim().is_empty() {
+                return Err("文字が見つかりませんでした".into());
+            }
             write_clipboard(&Content::Text(text.clone()))?;
             let hash = format!("t:{}", fnv1a(text.as_bytes()));
             finish_insert(
@@ -414,6 +420,8 @@ fn register_shortcuts(app: &AppHandle, s: &Settings) -> Vec<String> {
     let state = app.state::<AppState>();
     let mut map = state.shortcuts.lock().unwrap();
     map.clear();
+    let mut taps_map = state.double_taps.lock().unwrap();
+    taps_map.clear();
     let mut errors = vec![];
     let mut wanted = vec![
         ("パネル表示", s.panel_shortcut.clone(), Action::TogglePanel),
@@ -424,6 +432,19 @@ fn register_shortcuts(app: &AppHandle, s: &Settings) -> Vec<String> {
     }
     for (label, key, action) in wanted {
         if key.trim().is_empty() {
+            continue;
+        }
+        if key.starts_with(taps::PREFIX) {
+            match taps::Mod::parse(&key) {
+                Some(m) if taps_map.contains_key(&m) => {
+                    errors.push(format!("{label}: 他のショートカットと重複しています"));
+                }
+                Some(m) => {
+                    taps_map.insert(m, action);
+                    start_tap_watch(app);
+                }
+                None => errors.push(format!("{label}: {key} は無効なキーです")),
+            }
             continue;
         }
         match Shortcut::from_str(&key) {
@@ -445,6 +466,30 @@ fn register_shortcuts(app: &AppHandle, s: &Settings) -> Vec<String> {
         }
     }
     errors
+}
+
+fn run_action(app: &AppHandle, action: Action) {
+    match action {
+        Action::TogglePanel => toggle_panel(app),
+        Action::Screenshot => start_screenshot(app),
+        Action::Ocr => start_ocr(app),
+    }
+}
+
+/// 修飾キーの 2 回押しの監視を始める（必要になったときに 1 度だけ）
+fn start_tap_watch(app: &AppHandle) {
+    let handle = app.clone();
+    let started = taps::start(move |m| {
+        let action = handle.state::<AppState>().double_taps.lock().unwrap().get(&m).copied();
+        if let Some(action) = action {
+            let h = handle.clone();
+            let _ = handle.run_on_main_thread(move || run_action(&h, action));
+        }
+    });
+    if started {
+        // macOS の NSEvent 監視はメインスレッドで登録する必要がある
+        let _ = app.run_on_main_thread(platform::start_modifier_watch);
+    }
 }
 
 // ───────────────────────── 貼り付け ─────────────────────────
@@ -789,6 +834,7 @@ fn save_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> 
 fn pause_shortcuts(app: AppHandle, state: State<AppState>, paused: bool) {
     if paused {
         let _ = app.global_shortcut().unregister_all();
+        state.double_taps.lock().unwrap().clear();
     } else {
         let s = state.settings.lock().unwrap().clone();
         register_shortcuts(&app, &s);
@@ -828,6 +874,7 @@ fn init_state(app: &AppHandle) -> Res<AppState> {
         screenshot_until: AtomicI64::new(0),
         panel_height_now: std::sync::atomic::AtomicU64::new(PANEL_HEIGHT.to_bits()),
         shortcuts: Mutex::new(HashMap::new()),
+        double_taps: Mutex::new(HashMap::new()),
     })
 }
 
@@ -893,11 +940,8 @@ pub fn run() {
                         return;
                     }
                     let action = app.state::<AppState>().shortcuts.lock().unwrap().get(&shortcut.id()).copied();
-                    match action {
-                        Some(Action::TogglePanel) => toggle_panel(app),
-                        Some(Action::Screenshot) => start_screenshot(app),
-                        Some(Action::Ocr) => start_ocr(app),
-                        None => {}
+                    if let Some(action) = action {
+                        run_action(app, action);
                     }
                 })
                 .build(),
