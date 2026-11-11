@@ -107,6 +107,13 @@ export const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.p
 /** "CommandOrControl+Shift+V" → "⌘⇧V" / "Ctrl+Shift+V" */
 export function prettyShortcut(acc: string): string {
   if (!acc) return "未設定";
+  if (acc.startsWith("DoubleTap+")) {
+    const mod = acc.slice("DoubleTap+".length);
+    const name = isMac
+      ? ({ Control: "⌃", Shift: "⇧", Alt: "⌥", Command: "⌘" } as Record<string, string>)[mod] ?? mod
+      : ({ Control: "Ctrl", Command: "Win" } as Record<string, string>)[mod] ?? mod;
+    return `${name} を2回`;
+  }
   const parts = acc.split("+");
   if (isMac) {
     const map: Record<string, string> = {

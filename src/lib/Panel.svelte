@@ -1260,26 +1260,25 @@
   .cell > :global(.card) { flex: 1 1 auto; }
   .page > .newcard { height: 100%; }
   .list:not(.paged) > .newcard { flex: 0 0 150px; }
-  /* 多段: その日の最初のカードの左上に日付ラベル */
-  .day {
+  /* その日の最初のカードの左上に日付ラベル（多段・1段共通） */
+  .day, .daysep span {
     position: absolute; z-index: 2; top: -9px; left: 10px;
     padding: 1px 8px; border-radius: 999px;
     background: var(--fg); color: #15161a;
-    font-size: 10.5px; font-weight: 800; letter-spacing: 0.04em;
+    font-size: 10.5px; font-weight: 800; letter-spacing: 0.04em; white-space: nowrap;
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
     pointer-events: none;
   }
 
-  /* 日付の区切り: 1段は縦書きの細い列、多段は段をまたぐ見出し */
+  /* 1段: 日付の変わり目に細い区切り線。ラベルは右隣のカードの左上に横書きで載せる */
   .daysep {
-    flex: none;
-    display: flex; align-items: center; justify-content: center;
-    width: 22px;
-    color: var(--fg-dim); font-size: 11px; font-weight: 700; letter-spacing: 0.08em;
-    border-left: 1px solid var(--line);
+    flex: none; position: relative;
+    width: 1px;
+    background: var(--line);
   }
-  .daysep:first-child { border-left: 0; }
-  .daysep span { writing-mode: vertical-rl; white-space: nowrap; }
+  .daysep span { left: 23px; }
+  .daysep:first-child { background: transparent; margin-right: -13px; }
+  .daysep:first-child span { left: 10px; }
 
   .newcard {
     height: 100%;
