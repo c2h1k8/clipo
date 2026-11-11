@@ -1,6 +1,6 @@
 [package]
 name = "clipo"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lightweight clipboard manager"
 license = "MIT"
 authors = ["c2h1k8"]
