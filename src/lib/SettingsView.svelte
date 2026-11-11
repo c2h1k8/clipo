@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, isMac, TAG_COLORS, type Settings, type Tag } from "./api";
+  import { api, isMac, CARD_SIZES, TAG_COLORS, type CardSize, type Settings, type SourceApp, type Tag } from "./api";
   import ShortcutInput from "./ShortcutInput.svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -10,6 +10,42 @@
   let saved = $state(false);
   let trusted = $state(true);
   let confirmClear = $state(false);
+  let apps = $state<SourceApp[]>([]);
+  let addApp = $state("");
+  let ioMsg = $state("");
+  let importInput = $state<HTMLInputElement | null>(null);
+
+  function appName(id: string) {
+    return apps.find((a) => a.source_id === id)?.source_name ?? id;
+  }
+
+  function addExcluded() {
+    if (!s || !addApp || s.excluded_apps.includes(addApp)) return;
+    s.excluded_apps = [...s.excluded_apps, addApp];
+    addApp = "";
+  }
+
+  async function exportSaved() {
+    try {
+      const path = await api.exportSaved();
+      ioMsg = `書き出しました: ${path}`;
+    } catch (err) {
+      ioMsg = String(err);
+    }
+  }
+
+  async function importFile(e: Event) {
+    const f = (e.currentTarget as HTMLInputElement).files?.[0];
+    if (!f) return;
+    try {
+      const [added, updated] = await api.importSaved(await f.text());
+      ioMsg = `読み込みました（追加 ${added}件・更新 ${updated}件）`;
+      tags = await api.listTags();
+    } catch (err) {
+      ioMsg = String(err);
+    }
+    if (importInput) importInput.value = "";
+  }
   let savedTimer: ReturnType<typeof setTimeout>;
 
   const LANGS = [
@@ -84,6 +120,7 @@
     (async () => {
       s = await api.getSettings();
       tags = await api.listTags();
+      apps = (await api.sourceApps()).filter((a) => !a.source_id.startsWith("clipo."));
       trusted = await api.accessibilityStatus();
     })();
     const t = setInterval(async () => (trusted = await api.accessibilityStatus()), 3000);
@@ -144,6 +181,14 @@
         </div>
       </div>
       <div class="row">
+        <span>カードの大きさ<small>小にすると一度にたくさん見えます</small></span>
+        <div class="seg">
+          {#each Object.entries(CARD_SIZES) as [k, v]}
+            <button class:on={s.card_size === k} onclick={() => (s!.card_size = k as CardSize)}>{v.label}</button>
+          {/each}
+        </div>
+      </div>
+      <div class="row">
         <label class="check"><input type="checkbox" bind:checked={s.group_by_date} /> カードを日付ごとに区切って表示</label>
       </div>
       <div class="row">
@@ -153,12 +198,16 @@
           <input type="range" min="0" max="95" step="5" bind:value={s.panel_opacity} />
         </span>
       </div>
+      <div class="row">
+        <span>背景のぼかし<small>オフにすると後ろの画面がそのまま透けて見えます</small></span>
+        <label class="check"><input type="checkbox" bind:checked={s.panel_blur} /> すりガラスにする</label>
+      </div>
     </section>
 
     <section>
       <h2>履歴</h2>
       <div class="row">
-        <span>保存する件数<small>お気に入り・定型文は数えません</small></span>
+        <span>保存する件数<small>保存したものは数えません</small></span>
         <input class="num" type="number" min="10" max="10000" step="10" bind:value={s.max_history} />
       </div>
       <div class="row">
@@ -168,7 +217,7 @@
         </select>
       </div>
       <div class="row">
-        <span>履歴を全部消す<small>お気に入り・定型文は残ります</small></span>
+        <span>履歴を全部消す<small>保存したものは残ります</small></span>
         {#if confirmClear}
           <span class="inline">
             <button onclick={() => (confirmClear = false)}>やめる</button>
@@ -178,6 +227,41 @@
           <button onclick={() => (confirmClear = true)}>消去…</button>
         {/if}
       </div>
+    </section>
+
+    <section>
+      <h2>記録しないアプリ</h2>
+      {#each s.excluded_apps as id (id)}
+        <div class="row">
+          <span>{appName(id)}<small>{id}</small></span>
+          <button class="danger-ghost" onclick={() => (s!.excluded_apps = s!.excluded_apps.filter((x) => x !== id))}>外す</button>
+        </div>
+      {/each}
+      <div class="row">
+        <select bind:value={addApp}>
+          <option value="">最近コピーしたアプリから選ぶ…</option>
+          {#each apps.filter((a) => !s!.excluded_apps.includes(a.source_id)) as a (a.source_id)}
+            <option value={a.source_id}>{a.source_name}</option>
+          {/each}
+        </select>
+        <button onclick={addExcluded} disabled={!addApp}>追加</button>
+      </div>
+      <p class="help">パスワード管理アプリや銀行のアプリなどを入れておくと、そのアプリでコピーしたものは履歴に残りません（保存で反映）。少しのあいだ全部止めたいときは、メニューバー{isMac ? "" : "（タスクトレイ）"}の Clipo から「記録を一時停止」。</p>
+    </section>
+
+    <section>
+      <h2>保存したものの書き出し・読み込み</h2>
+      <div class="row">
+        <span>書き出す<small>保存したテキストとリンク（タイトル・短い名前・タグ付き）をダウンロードフォルダへ</small></span>
+        <button onclick={exportSaved}>書き出す</button>
+      </div>
+      <div class="row">
+        <span>読み込む<small>別のパソコンで書き出したファイルを取り込みます。同じ内容は重複しません</small></span>
+        <button onclick={() => importInput?.click()}>ファイルを選ぶ…</button>
+        <input bind:this={importInput} type="file" accept=".json,application/json" hidden onchange={importFile} />
+      </div>
+      {#if ioMsg}<p class="help">{ioMsg}</p>{/if}
+      <p class="help">画像とファイルはパソコンごとに場所が違うため含めません。</p>
     </section>
 
     <section>

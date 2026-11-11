@@ -4,7 +4,7 @@ mod settings;
 mod taps;
 mod translate;
 
-use db::{now_ms, Db, Filter, Item, NewItem, SourceApp, Tag};
+use db::{fnv1a, now_ms, text_hash, Db, ExportFile, Filter, Item, NewItem, SourceApp, Tag};
 use settings::Settings;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -19,9 +19,12 @@ use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 const PANEL: &str = "panel";
-/// 1 段のときのパネルの高さ。段を増やすごとに ROW_HEIGHT ずつ高くなる
+/// 最初に出すときのパネルの高さ（中サイズ 1 段）。実際の高さはフロント側から resize_panel で合わせる
 const PANEL_HEIGHT: f64 = 300.0;
-const ROW_HEIGHT: f64 = 216.0;
+/// パネルの高さの下限（小サイズ 1 段より少し低め）
+const MIN_PANEL_HEIGHT: f64 = 240.0;
+/// いちばん大きいカード 1 段ぶんの高さ（カード + 間隔）。上限の計算に使う
+const ROW_HEIGHT: f64 = 252.0;
 /// 多段表示の日付見出し 1 つぶんの高さ（見出し 20 + 間隔 12）
 const DAY_HEADER_HEIGHT: f64 = 32.0;
 const PANEL_MARGIN: f64 = 12.0;
@@ -40,6 +43,10 @@ pub struct AppState {
     data_dir: PathBuf,
     /// 自分で貼り付け中（自分の書き込みを履歴に拾わない）
     pasting: AtomicBool,
+    /// 記録を一時停止中
+    paused: AtomicBool,
+    /// 「続けて貼る」の残り（⌘V / Ctrl+V のたびに次をクリップボードへ）
+    queue: Mutex<std::collections::VecDeque<(i64, Content)>>,
     last_count: AtomicI64,
     /// この時刻(ms)までに来た画像はスクショ扱い
     screenshot_until: AtomicI64,
@@ -55,14 +62,6 @@ fn e<E: ToString>(err: E) -> String {
     err.to_string()
 }
 
-fn fnv1a(bytes: &[u8]) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{h:016x}{:x}", bytes.len())
-}
 
 fn remove_files(files: Vec<String>) {
     for f in files {
@@ -86,8 +85,16 @@ fn start_monitor(app: AppHandle) {
             if state.pasting.load(Ordering::SeqCst) || platform::is_concealed() {
                 continue;
             }
+            if state.paused.load(Ordering::SeqCst) {
+                continue;
+            }
             // コピー元はできるだけ早く取る（ユーザーがアプリを切り替える前に）
             let src = platform::source_app();
+            if src.as_ref().is_some_and(|a| is_excluded(&state, &a.id)) {
+                continue;
+            }
+            // 自分以外がコピーしたら「続けて貼る」は終わり
+            state.queue.lock().unwrap().clear();
             let shot = now_ms() < state.screenshot_until.load(Ordering::SeqCst)
                 || platform::screenshot_ui_running();
             if let Err(err) = capture(&app, &state, src, shot, &mut tried_icons) {
@@ -95,6 +102,10 @@ fn start_monitor(app: AppHandle) {
             }
         }
     });
+}
+
+fn is_excluded(state: &AppState, app_id: &str) -> bool {
+    state.settings.lock().unwrap().excluded_apps.iter().any(|x| x.eq_ignore_ascii_case(app_id))
 }
 
 /// OS 標準スクショの保存先を見張り、新しいスクショを履歴とクリップボードに入れる
@@ -176,6 +187,10 @@ fn capture(
     shot: bool,
     tried: &mut HashSet<String>,
 ) -> Res<()> {
+    // ファイル（Finder / エクスプローラーでコピー）はファイル名の文字より先に見る
+    if let Some(files) = platform::read_files() {
+        return capture_files(app, state, src, tried, &files);
+    }
     let mut cb = open_clipboard()?;
 
     let text = match cb.get_text() {
@@ -189,7 +204,7 @@ fn capture(
     if let Ok(text) = text {
         if !text.trim().is_empty() {
             let icon = src.as_ref().and_then(|s| icon_for(state, s, tried));
-            let hash = format!("t:{}", fnv1a(text.as_bytes()));
+            let hash = text_hash(&text);
             let item = NewItem {
                 kind: "text",
                 text: Some(&text),
@@ -246,6 +261,37 @@ fn capture(
     finish_insert(app, state, &item)
 }
 
+/// コピーされたファイルを「ファイル」カードとして記録（中身はパスを改行でつないだもの）
+fn capture_files(
+    app: &AppHandle,
+    state: &AppState,
+    src: Option<platform::AppInfo>,
+    tried: &mut HashSet<String>,
+    files: &[String],
+) -> Res<()> {
+    let text = files.join("\n");
+    let hash = format!("f:{}", fnv1a(text.as_bytes()));
+    // 1 つ目のファイルのアイコン（Finder と同じもの）をサムネイルにする
+    let dir = state.data_dir.join("icons");
+    let thumb = dir.join(format!("file-{}.png", &hash[2..]));
+    let thumb = (thumb.exists() || platform::save_file_icon(&files[0], &thumb))
+        .then(|| thumb.to_string_lossy().to_string());
+    let icon = src.as_ref().and_then(|s| icon_for(state, s, tried));
+    let item = NewItem {
+        kind: "file",
+        text: Some(&text),
+        image_path: None,
+        thumb_path: thumb.as_deref(),
+        width: None,
+        height: None,
+        hash: &hash,
+        source_name: src.as_ref().map(|s| s.name.as_str()),
+        source_id: src.as_ref().map(|s| s.id.as_str()),
+        source_icon: icon.as_deref(),
+    };
+    finish_insert(app, state, &item)
+}
+
 fn fit(w: u32, h: u32, mw: u32, mh: u32) -> (u32, u32) {
     let s = (mw as f64 / w as f64).min(mh as f64 / h as f64).min(1.0);
     (((w as f64 * s) as u32).max(1), ((h as f64 * s) as u32).max(1))
@@ -290,7 +336,7 @@ fn place_panel(win: &tauri::WebviewWindow, m: &tauri::Monitor, logical_h: f64) {
     let wa = m.work_area();
     let scale = m.scale_factor();
     let margin = (PANEL_MARGIN * scale) as i32;
-    let logical_h = logical_h.max(PANEL_HEIGHT);
+    let logical_h = logical_h.max(MIN_PANEL_HEIGHT);
     let height = ((logical_h * scale) as u32).min(wa.size.height.saturating_sub(2 * margin as u32));
     let width = wa.size.width.saturating_sub(2 * margin as u32);
     let _ = win.set_size(PhysicalSize::new(width, height));
@@ -304,8 +350,9 @@ fn place_panel(win: &tauri::WebviewWindow, m: &tauri::Monitor, logical_h: f64) {
 #[tauri::command]
 fn resize_panel(app: AppHandle, state: State<AppState>, height: f64) {
     let max_rows = state.settings.lock().unwrap().panel_rows.max(1) as f64;
-    let max_h = PANEL_HEIGHT + (max_rows - 1.0) * ROW_HEIGHT + DAY_HEADER_HEIGHT;
-    let h = height.round().clamp(PANEL_HEIGHT, max_h);
+    // カードの大きさで高さが変わるので、下限・上限はゆるめに取る
+    let max_h = 96.0 + max_rows * ROW_HEIGHT + DAY_HEADER_HEIGHT;
+    let h = height.round().clamp(MIN_PANEL_HEIGHT, max_h);
     if f64::from_bits(state.panel_height_now.swap(h.to_bits(), Ordering::SeqCst)) == h {
         return;
     }
@@ -360,7 +407,7 @@ fn start_ocr(app: &AppHandle) {
                 return Err("文字が見つかりませんでした".into());
             }
             write_clipboard(&Content::Text(text.clone()))?;
-            let hash = format!("t:{}", fnv1a(text.as_bytes()));
+            let hash = text_hash(&text);
             finish_insert(
                 &app,
                 &state,
@@ -486,6 +533,8 @@ fn start_tap_watch(app: &AppHandle) {
             let _ = handle.run_on_main_thread(move || run_action(&h, action));
         }
     });
+    let h2 = app.clone();
+    taps::on_paste(move || on_user_paste(&h2));
     if started {
         // macOS の NSEvent 監視はメインスレッドで登録する必要がある
         let _ = app.run_on_main_thread(platform::start_modifier_watch);
@@ -509,8 +558,19 @@ fn send_paste_keys() -> Res<()> {
     Ok(())
 }
 
+/// カーソルを左へ n 文字動かす（{カーソル} の位置へ戻す）
+fn send_left_keys(n: usize) -> Res<()> {
+    use enigo::{Direction, Enigo, Key, Keyboard, Settings as ES};
+    let mut en = Enigo::new(&ES::default()).map_err(e)?;
+    for _ in 0..n.min(5000) {
+        en.key(Key::LeftArrow, Direction::Click).map_err(e)?;
+    }
+    Ok(())
+}
+
 enum Content {
     Text(String),
+    Files(Vec<String>),
     Image(PathBuf),
 }
 
@@ -518,6 +578,10 @@ fn write_clipboard(c: &Content) -> Res<()> {
     let mut cb = open_clipboard()?;
     match c {
         Content::Text(t) => cb.set_text(t.clone()).map_err(e),
+        Content::Files(paths) => {
+            drop(cb);
+            platform::write_files(paths)
+        }
         Content::Image(p) => {
             let img = image::open(p).map_err(e)?.to_rgba8();
             let (w, h) = img.dimensions();
@@ -531,13 +595,63 @@ fn write_clipboard(c: &Content) -> Res<()> {
     }
 }
 
-fn load_contents(state: &AppState, ids: &[i64], sep: &str) -> Res<Vec<Content>> {
+/// 貼り付け時に置き換える値（日時はパネル側のローカル時刻）
+#[derive(serde::Deserialize, Default)]
+struct PasteVars {
+    date: String,
+    time: String,
+}
+
+/// 貼ったあとのカーソル位置の目印（私用領域の文字）
+const CURSOR_MARK: char = '\u{E000}';
+
+/// 保存したテキストの差し込み記号を置き換える。{カーソル} は目印に変える
+fn expand_vars(text: &str, vars: &PasteVars, clip: &mut Option<Option<String>>) -> String {
+    let mut out = text.replace("{日付}", &vars.date).replace("{時刻}", &vars.time);
+    if out.contains("{クリップボード}") {
+        let c = clip.get_or_insert_with(|| open_clipboard().ok().and_then(|mut cb| cb.get_text().ok()));
+        out = out.replace("{クリップボード}", c.as_deref().unwrap_or(""));
+    }
+    out.replace("{カーソル}", &CURSOR_MARK.to_string())
+}
+
+/// 貼る中身と、貼ったあとカーソルを左へ戻す文字数
+/// as_path=true ならファイルをフルパスの文字として貼る
+fn load_contents(
+    state: &AppState,
+    ids: &[i64],
+    sep: &str,
+    vars: &PasteVars,
+    as_path: bool,
+) -> Res<(Vec<Content>, usize)> {
     let db = state.db.lock().unwrap();
     let mut out = vec![];
+    let mut clip = None;
     for id in ids {
         match db.content(*id).map_err(e)? {
             Some((k, _, Some(p))) if k == "image" => out.push(Content::Image(p.into())),
-            Some((_, Some(t), _)) => out.push(Content::Text(t)),
+            Some((k, Some(t), _)) if k == "file" => {
+                let paths: Vec<String> = t.lines().map(str::to_string).collect();
+                if as_path {
+                    out.push(Content::Text(paths.join("\n")));
+                    continue;
+                }
+                let alive: Vec<String> =
+                    paths.into_iter().filter(|p| std::path::Path::new(p).exists()).collect();
+                if alive.is_empty() {
+                    return Err("ファイルが見つかりません（移動または削除されています）".into());
+                }
+                // 続けて選んだファイルは 1 回でまとめて貼る
+                if let Some(Content::Files(prev)) = out.last_mut() {
+                    prev.extend(alive);
+                } else {
+                    out.push(Content::Files(alive));
+                }
+            }
+            Some((_, Some(t), _)) => {
+                let t = if db.is_saved(*id).map_err(e)? { expand_vars(&t, vars, &mut clip) } else { t };
+                out.push(Content::Text(t));
+            }
             _ => {}
         }
     }
@@ -551,9 +665,22 @@ fn load_contents(state: &AppState, ids: &[i64], sep: &str) -> Res<Vec<Content>> 
             })
             .collect::<Vec<_>>()
             .join(sep);
-        return Ok(vec![Content::Text(joined)]);
+        out = vec![Content::Text(joined)];
     }
-    Ok(out)
+    // 最初の目印の位置をカーソル位置にして、目印は全部消す
+    let mut back = 0;
+    let single = out.len() == 1;
+    for c in out.iter_mut() {
+        if let Content::Text(t) = c {
+            if let Some(pos) = t.find(CURSOR_MARK) {
+                if single {
+                    back = t[pos..].chars().filter(|&ch| ch != CURSOR_MARK).count();
+                }
+                *t = t.replace(CURSOR_MARK, "");
+            }
+        }
+    }
+    Ok((out, back))
 }
 
 // ───────────────────────── コマンド ─────────────────────────
@@ -565,6 +692,10 @@ fn list_items(state: State<AppState>, filter: Filter) -> Res<Vec<Item>> {
     for it in items.iter_mut() {
         if it.source_icon.as_deref().is_some_and(|p| !std::path::Path::new(p).exists()) {
             it.source_icon = None;
+        }
+        if it.kind == "file" {
+            let text = state.db.lock().unwrap().original_text(it.id).ok().flatten().unwrap_or_default();
+            it.missing = !text.lines().all(|p| std::path::Path::new(p).exists());
         }
     }
     Ok(items)
@@ -635,8 +766,12 @@ fn set_tag(state: State<AppState>, item_ids: Vec<i64>, tag_id: i64, on: bool) ->
 }
 
 #[tauri::command]
-fn set_favorite(state: State<AppState>, id: i64, favorite: bool) -> Res<()> {
-    state.db.lock().unwrap().set_favorite(id, favorite).map_err(e)
+fn set_saved(state: State<AppState>, ids: Vec<i64>, saved: bool) -> Res<()> {
+    let db = state.db.lock().unwrap();
+    for id in ids {
+        db.set_saved(id, saved).map_err(e)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -659,22 +794,53 @@ fn clear_history(state: State<AppState>) -> Res<()> {
     Ok(())
 }
 
+/// 保存の追加・編集。text は画像なら None
 #[tauri::command]
-fn save_snippet(state: State<AppState>, id: Option<i64>, title: String, text: String) -> Res<i64> {
-    if text.is_empty() {
+fn save_item(
+    state: State<AppState>,
+    id: Option<i64>,
+    title: String,
+    keyword: String,
+    text: Option<String>,
+) -> Res<i64> {
+    if text.as_deref().is_some_and(|t| t.is_empty()) {
         return Err("本文が空です".into());
     }
-    state.db.lock().unwrap().save_snippet(id, &title, &text).map_err(e)
+    state
+        .db
+        .lock()
+        .unwrap()
+        .save_item(id, &title, &keyword, text.as_deref())
+        .map_err(e)?
+        .ok_or_else(|| "同じ内容がすでに保存されています".into())
 }
 
 /// 選択アイテムを貼り付ける。copy_only=true ならクリップボードに入れるだけ
 #[tauri::command]
-fn paste_items(app: AppHandle, state: State<AppState>, ids: Vec<i64>, copy_only: bool) -> Res<()> {
+fn paste_items(
+    app: AppHandle,
+    state: State<AppState>,
+    ids: Vec<i64>,
+    copy_only: bool,
+    vars: Option<PasteVars>,
+    as_path: Option<bool>,
+    transform: Option<String>,
+) -> Res<()> {
     if ids.is_empty() {
         return Ok(());
     }
+    state.queue.lock().unwrap().clear();
     let sep = state.settings.lock().unwrap().multi_separator.clone();
-    let contents = load_contents(&state, &ids, &sep)?;
+    let (mut contents, mut cursor_back) =
+        load_contents(&state, &ids, &sep, &vars.unwrap_or_default(), as_path.unwrap_or(false))?;
+    if let Some(t) = transform.as_deref() {
+        for c in contents.iter_mut() {
+            if let Content::Text(s) = c {
+                *s = transform_text(s, t);
+            }
+        }
+        cursor_back = 0;
+    }
     hide_panel_inner(&app);
 
     let app2 = app.clone();
@@ -705,6 +871,9 @@ fn paste_items(app: AppHandle, state: State<AppState>, ids: Vec<i64>, copy_only:
                 send_paste_keys()?;
                 std::thread::sleep(Duration::from_millis(180));
             }
+            if cursor_back > 0 {
+                send_left_keys(cursor_back)?;
+            }
             Ok(())
         })();
         if let Err(err) = result {
@@ -722,6 +891,161 @@ fn paste_items(app: AppHandle, state: State<AppState>, ids: Vec<i64>, copy_only:
         let _ = app2.emit("clips-changed", ());
     });
     Ok(())
+}
+
+/// 形を変えて貼る
+fn transform_text(s: &str, how: &str) -> String {
+    match how {
+        // 全角の英数字・記号・空白 → 半角
+        "half" => s
+            .chars()
+            .map(|c| match c {
+                '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+                '\u{3000}' => ' ',
+                _ => c,
+            })
+            .collect(),
+        // 半角の英数字・記号・空白 → 全角
+        "full" => s
+            .chars()
+            .map(|c| match c {
+                '!'..='~' => char::from_u32(c as u32 + 0xFEE0).unwrap_or(c),
+                ' ' => '\u{3000}',
+                _ => c,
+            })
+            .collect(),
+        // 改行を消す（前後の空白も詰める）
+        "oneline" => s.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(""),
+        "trim" => s.lines().map(str::trim).collect::<Vec<_>>().join("\n").trim().to_string(),
+        "upper" => s.to_uppercase(),
+        "lower" => s.to_lowercase(),
+        _ => s.to_string(),
+    }
+}
+
+/// 「続けて貼る」を始める。1 件目をクリップボードに入れ、⌘V / Ctrl+V のたびに次を入れる
+#[tauri::command]
+fn start_queue(app: AppHandle, state: State<AppState>, ids: Vec<i64>, vars: Option<PasteVars>) -> Res<usize> {
+    let vars = vars.unwrap_or_default();
+    let mut items = std::collections::VecDeque::new();
+    for id in &ids {
+        // 1 件ずつ（つながない）
+        let (mut cs, _) = load_contents(&state, &[*id], "", &vars, false)?;
+        if let Some(c) = cs.pop() {
+            items.push_back((*id, c));
+        }
+    }
+    let n = items.len();
+    let Some((first_id, first)) = items.pop_front() else { return Ok(0) };
+    start_tap_watch(&app);
+    hide_panel_inner(&app);
+    state.pasting.store(true, Ordering::SeqCst);
+    let r = write_clipboard(&first);
+    platform::activate_target();
+    std::thread::sleep(Duration::from_millis(200));
+    state.last_count.store(platform::change_count(), Ordering::SeqCst);
+    state.pasting.store(false, Ordering::SeqCst);
+    r?;
+    let _ = state.db.lock().unwrap().touch(first_id);
+    *state.queue.lock().unwrap() = items;
+    let _ = app.emit("clips-changed", ());
+    Ok(n)
+}
+
+/// ユーザーが ⌘V / Ctrl+V を押した: 「続けて貼る」中なら少し待って次をクリップボードへ
+fn on_user_paste(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if state.queue.lock().unwrap().is_empty() {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // 貼り付け先がいまのクリップボードを読み終えるのを待つ
+        std::thread::sleep(Duration::from_millis(350));
+        let state = app.state::<AppState>();
+        let Some((id, next)) = state.queue.lock().unwrap().pop_front() else { return };
+        state.pasting.store(true, Ordering::SeqCst);
+        if let Err(err) = write_clipboard(&next) {
+            log::warn!("queue paste failed: {err}");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        state.last_count.store(platform::change_count(), Ordering::SeqCst);
+        state.pasting.store(false, Ordering::SeqCst);
+        let _ = state.db.lock().unwrap().touch(id);
+        let _ = app.emit("clips-changed", ());
+    });
+}
+
+/// リンクをブラウザで開く（http/https だけ）
+#[tauri::command]
+fn open_url(url: String) -> Res<()> {
+    let url = url.trim();
+    let ok = (url.starts_with("https://") || url.starts_with("http://"))
+        && !url.chars().any(|c| c.is_whitespace() || c == '"' || c == '\'' || c.is_control());
+    if !ok {
+        return Err("開けないリンクです".into());
+    }
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(windows)]
+    let r = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let r = std::process::Command::new("xdg-open").arg(url).spawn();
+    r.map(|_| ()).map_err(e)
+}
+
+#[tauri::command]
+fn set_paused(app: AppHandle, state: State<AppState>, paused: bool) {
+    state.paused.store(paused, Ordering::SeqCst);
+    // 再開時、止めていたあいだのコピーは拾わない
+    state.last_count.store(platform::change_count(), Ordering::SeqCst);
+    update_tray_pause(&app, paused);
+    let _ = app.emit("paused-changed", paused);
+}
+
+#[tauri::command]
+fn get_paused(state: State<AppState>) -> bool {
+    state.paused.load(Ordering::SeqCst)
+}
+
+/// 保存したテキストをファイルに書き出す（ダウンロードフォルダ）。保存先のパスを返す
+#[tauri::command]
+fn export_saved(app: AppHandle, state: State<AppState>) -> Res<String> {
+    let data = state.db.lock().unwrap().export_saved().map_err(e)?;
+    let dir = app.path().download_dir().or_else(|_| app.path().home_dir()).map_err(e)?;
+    let name = format!("Clipo-保存-{}.json", chrono_like_date());
+    let path = dir.join(name);
+    std::fs::write(&path, serde_json::to_string_pretty(&data).map_err(e)?).map_err(e)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 書き出したファイルの中身を読み込む。(追加, 更新) の件数
+#[tauri::command]
+fn import_saved(app: AppHandle, state: State<AppState>, json: String) -> Res<(usize, usize)> {
+    let data: ExportFile = serde_json::from_str(&json).map_err(|_| "Clipo の書き出しファイルではありません".to_string())?;
+    if data.app != "Clipo" {
+        return Err("Clipo の書き出しファイルではありません".into());
+    }
+    let r = state.db.lock().unwrap().import_saved(&data).map_err(e)?;
+    let _ = app.emit("clips-changed", ());
+    Ok(r)
+}
+
+/// ファイル名用の日付（YYYYMMDD-HHMMSS、UTC）
+fn chrono_like_date() -> String {
+    let secs = now_ms() / 1000;
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // 1970-01-01 からの日数 → 年月日（Howard Hinnant のアルゴリズム）
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 /// テキストを翻訳してカードに保存し、訳文を返す
@@ -764,7 +1088,7 @@ async fn ocr_item(app: AppHandle, id: i64) -> Res<()> {
         if text.trim().is_empty() {
             return Err("文字が見つかりませんでした".into());
         }
-        let hash = format!("t:{}", fnv1a(text.as_bytes()));
+        let hash = text_hash(&text);
         finish_insert(
             &app,
             &state,
@@ -825,6 +1149,9 @@ fn save_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> 
     let files = state.db.lock().unwrap().prune(s.max_history).map_err(e)?;
     remove_files(files);
     let errors = register_shortcuts(&app, &s);
+    if let Some(panel) = app.get_webview_window(PANEL) {
+        platform::style_panel(&panel, s.panel_blur);
+    }
     let _ = app.emit("settings-changed", ());
     Ok(errors)
 }
@@ -870,6 +1197,8 @@ fn init_state(app: &AppHandle) -> Res<AppState> {
         settings_path,
         data_dir,
         pasting: AtomicBool::new(false),
+        paused: AtomicBool::new(false),
+        queue: Mutex::new(Default::default()),
         last_count: AtomicI64::new(0),
         screenshot_until: AtomicI64::new(0),
         panel_height_now: std::sync::atomic::AtomicU64::new(PANEL_HEIGHT.to_bits()),
@@ -878,13 +1207,27 @@ fn init_state(app: &AppHandle) -> Res<AppState> {
     })
 }
 
+/// トレイの「記録を一時停止」項目（文言を切り替える）
+struct TrayPause(MenuItem<tauri::Wry>);
+
+fn update_tray_pause(app: &AppHandle, paused: bool) {
+    if let Some(t) = app.try_state::<TrayPause>() {
+        let _ = t.0.set_text(if paused { "記録を再開" } else { "記録を一時停止" });
+    }
+    if let Some(tray) = app.tray_by_id("main") {
+        let _ = tray.set_tooltip(Some(if paused { "Clipo（記録を一時停止中）" } else { "Clipo" }));
+    }
+}
+
 fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "履歴を開く", true, None::<&str>)?;
     let shot = MenuItem::with_id(app, "shot", "範囲スクショ", true, None::<&str>)?;
     let ocr = MenuItem::with_id(app, "ocr", "範囲を文字起こし", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "設定…", true, None::<&str>)?;
+    let pause = MenuItem::with_id(app, "pause", "記録を一時停止", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Clipo を終了", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &ocr, &shot, &settings, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &ocr, &shot, &pause, &settings, &quit])?;
+    app.manage(TrayPause(pause.clone()));
     // macOS はメニューバーに合わせて白黒反転するテンプレート画像、Windows はカラー
     #[cfg(target_os = "macos")]
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
@@ -913,6 +1256,11 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, ev| match ev.id().as_ref() {
             "open" => show_panel(app),
             "shot" => start_screenshot(app),
+            "pause" => {
+                let state = app.state::<AppState>();
+                let paused = !state.paused.load(Ordering::SeqCst);
+                set_paused(app.clone(), state, paused);
+            }
             "ocr" => start_ocr(app),
             // メニューイベントハンドラ内での生成も Windows でデッドロックするので別スレッドで行う
             "settings" => {
@@ -963,7 +1311,8 @@ pub fn run() {
             start_screenshot_watcher(handle.clone());
 
             if let Some(panel) = app.get_webview_window(PANEL) {
-                platform::style_panel(&panel);
+                let blur = handle.state::<AppState>().settings.lock().unwrap().panel_blur;
+                platform::style_panel(&panel, blur);
                 let h = handle.clone();
                 panel.on_window_event(move |ev| {
                     if let tauri::WindowEvent::Focused(false) = ev {
@@ -983,10 +1332,10 @@ pub fn run() {
             update_tag,
             toggle_tag,
             set_tag,
-            set_favorite,
+            set_saved,
             delete_items,
             clear_history,
-            save_snippet,
+            save_item,
             paste_items,
             hide_panel,
             resize_panel,
@@ -1002,6 +1351,12 @@ pub fn run() {
             accessibility_status,
             open_accessibility,
             platform_name,
+            start_queue,
+            open_url,
+            set_paused,
+            get_paused,
+            export_saved,
+            import_saved,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Clipo")
@@ -1015,3 +1370,33 @@ pub fn run() {
         });
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transforms() {
+        assert_eq!(transform_text("ＡＢＣ１２３！　ｘ", "half"), "ABC123! x");
+        assert_eq!(transform_text("Ab1 !", "full"), "Ａｂ１　！");
+        assert_eq!(transform_text("  a\n b \n\n c ", "oneline"), "abc");
+        assert_eq!(transform_text("  a \n b  ", "trim"), "a\nb");
+        assert_eq!(transform_text("aBc", "upper"), "ABC");
+        assert_eq!(transform_text("日本語ＡＢ", "half"), "日本語AB");
+    }
+
+    #[test]
+    fn date_format() {
+        let s = chrono_like_date();
+        assert_eq!(s.len(), 15);
+        assert!(s.starts_with("20"));
+    }
+
+    #[test]
+    fn cursor_mark() {
+        let vars = PasteVars { date: "2026/11/11".into(), time: "10:00".into() };
+        let mut clip = Some(None);
+        let out = expand_vars("a{カーソル}bc {日付}", &vars, &mut clip);
+        assert_eq!(out, format!("a{CURSOR_MARK}bc 2026/11/11"));
+    }
+}
