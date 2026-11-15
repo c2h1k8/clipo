@@ -1144,8 +1144,7 @@ fn save_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> 
     let s = settings.normalized();
     s.save(&state.settings_path).map_err(e)?;
     *state.settings.lock().unwrap() = s.clone();
-    let al = app.autolaunch();
-    let _ = if s.launch_at_login { al.enable() } else { al.disable() };
+    apply_launch_at_login(&app, s.launch_at_login);
     let files = state.db.lock().unwrap().prune(s.max_history).map_err(e)?;
     remove_files(files);
     let errors = register_shortcuts(&app, &s);
@@ -1184,6 +1183,17 @@ fn platform_name() -> &'static str {
 }
 
 // ───────────────────────── 起動 ─────────────────────────
+
+/// ログイン時起動の登録を今の実行ファイルに合わせる。
+/// 開発版（debug ビルド）で登録すると開発版の場所が登録され、
+/// 再起動時に開発サーバーなしの開発版が起動して画面が真っ白になるため、debug では触らない
+fn apply_launch_at_login(app: &AppHandle, on: bool) {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let al = app.autolaunch();
+    let _ = if on { al.enable() } else { al.disable() };
+}
 
 fn init_state(app: &AppHandle) -> Res<AppState> {
     let data_dir = app.path().app_data_dir().map_err(e)?;
@@ -1302,6 +1312,8 @@ pub fn run() {
             let state = init_state(&handle)?;
             let settings = state.settings.lock().unwrap().clone();
             app.manage(state);
+            // 別の場所（開発版や古いコピー）が登録されていても、起動したアプリの場所に直す
+            apply_launch_at_login(&handle, settings.launch_at_login);
 
             for err in register_shortcuts(&handle, &settings) {
                 log::warn!("{err}");
