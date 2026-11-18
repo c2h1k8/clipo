@@ -268,10 +268,29 @@ jobs:
       - name: Upload to the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          REPO: ${{ github.repository }}
+        # 下書きは公開するまでタグがないので、gh release upload v<version> だと "release not found" になる。
+        # prepare が作った Release の ID で直接アップロードする
         run: |
+          if [ -z "$RELEASE_ID" ]; then
+            echo "::error::release_id が空です（成果物を添付できないので止めます）"
+            exit 1
+          fi
           dmg=$(ls src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          name=$(basename "$dmg")
           echo "$dmg"
-          gh release upload "v${{ needs.prepare.outputs.version }}" "$dmg" --clobber
+          # 再実行のとき用: 同じ名前の添付が残っていたら消す
+          old=$(gh api "repos/$REPO/releases/$RELEASE_ID/assets" -q ".[] | select(.name == \"$name\") | .id")
+          if [ -n "$old" ]; then
+            gh api -X DELETE "repos/$REPO/releases/assets/$old"
+          fi
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"$dmg" \
+            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$name" > /dev/null
+          echo "$name を添付しました"
 
   publish:
     needs: [prepare, build-windows, bundle-mac]
