@@ -68,6 +68,155 @@ pub fn remember_target() {
     }
 }
 
+// ───────── Finder への貼り付けで画像をファイルにする ─────────
+
+mod ffi {
+    use std::ffi::c_void;
+    pub type Ref = *mut c_void;
+    pub type TapCallback = unsafe extern "C" fn(Ref, u32, Ref, Ref) -> Ref;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        pub fn AXUIElementCreateApplication(pid: i32) -> Ref;
+        pub fn AXUIElementCopyAttributeValue(el: Ref, attr: *const c_void, value: *mut Ref) -> i32;
+        pub fn AXUIElementSetMessagingTimeout(el: Ref, seconds: f32) -> i32;
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        pub fn CGEventTapCreate(tap: u32, place: u32, options: u32, mask: u64, cb: TapCallback, info: Ref) -> Ref;
+        pub fn CGEventTapEnable(tap: Ref, enable: bool);
+        pub fn CGEventGetIntegerValueField(ev: Ref, field: u32) -> i64;
+        pub fn CGEventGetFlags(ev: Ref) -> u64;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        pub fn CFMachPortCreateRunLoopSource(alloc: Ref, port: Ref, order: isize) -> Ref;
+        pub fn CFRunLoopGetCurrent() -> Ref;
+        pub fn CFRunLoopAddSource(rl: Ref, source: Ref, mode: *const c_void);
+        pub fn CFRunLoopRun();
+        pub fn CFRelease(cf: Ref);
+        pub static kCFRunLoopCommonModes: *const c_void;
+    }
+}
+
+/// アクセシビリティ要素の属性を 1 つ読む（呼び出し側で CFRelease する）
+unsafe fn ax_attr(el: ffi::Ref, name: &str) -> Option<ffi::Ref> {
+    let attr = NSString::from_str(name);
+    let mut out: ffi::Ref = std::ptr::null_mut();
+    let err = unsafe {
+        ffi::AXUIElementSetMessagingTimeout(el, 0.25);
+        ffi::AXUIElementCopyAttributeValue(el, objc2::rc::Retained::as_ptr(&attr).cast(), &mut out)
+    };
+    (err == 0 && !out.is_null()).then_some(out)
+}
+
+/// そのアプリでいま入力の対象になっている部品の種類（AXTextField など）
+fn focused_role(pid: i32) -> Option<String> {
+    unsafe {
+        let app = ffi::AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        let focused = ax_attr(app, "AXFocusedUIElement");
+        ffi::CFRelease(app);
+        let focused = focused?;
+        let role = ax_attr(focused, "AXRole");
+        ffi::CFRelease(focused);
+        let role = role?;
+        let s = (*(role as *const NSString)).to_string();
+        ffi::CFRelease(role);
+        Some(s)
+    }
+}
+
+/// Finder で、名前の変更や検索欄などの文字入力中でなければ true
+fn finder_wants_files(pid: i32, bundle_id: &str) -> bool {
+    bundle_id == "com.apple.finder"
+        && !focused_role(pid).is_some_and(|r| matches!(r.as_str(), "AXTextField" | "AXTextArea" | "AXComboBox"))
+}
+
+/// パネルから貼る先（覚えておいたアプリ）が、ファイルを置ける場所か
+pub fn target_wants_files() -> bool {
+    let pid = TARGET_PID.load(Ordering::SeqCst);
+    if pid == 0 {
+        return false;
+    }
+    let id = unsafe {
+        NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            .and_then(|a| a.bundleIdentifier())
+            .map(|s| s.to_string())
+    };
+    id.is_some_and(|id| finder_wants_files(pid, &id))
+}
+
+static PASTE_HANDLER: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+static PASTE_TAP: std::sync::atomic::AtomicPtr<std::ffi::c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+unsafe extern "C" fn paste_tap(_proxy: ffi::Ref, ty: u32, ev: ffi::Ref, _info: ffi::Ref) -> ffi::Ref {
+    const KEY_DOWN: u32 = 10;
+    const DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+    const DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
+    const FIELD_AUTOREPEAT: u32 = 8;
+    const FIELD_KEYCODE: u32 = 9;
+    const CMD: u64 = 0x10_0000;
+    const OTHER_MODS: u64 = 0x2_0000 | 0x4_0000 | 0x8_0000; // Shift / Control / Option
+    unsafe {
+        if ty == DISABLED_BY_TIMEOUT || ty == DISABLED_BY_USER_INPUT {
+            // 止められたら付け直す
+            let tap = PASTE_TAP.load(Ordering::SeqCst);
+            if !tap.is_null() {
+                ffi::CGEventTapEnable(tap, true);
+            }
+            return ev;
+        }
+        if ty != KEY_DOWN
+            || ffi::CGEventGetIntegerValueField(ev, FIELD_KEYCODE) != 9 // kVK_ANSI_V
+            || ffi::CGEventGetIntegerValueField(ev, FIELD_AUTOREPEAT) != 0
+        {
+            return ev;
+        }
+        let flags = ffi::CGEventGetFlags(ev);
+        if flags & CMD == 0 || flags & OTHER_MODS != 0 {
+            return ev;
+        }
+        if frontmost().is_some_and(|a| finder_wants_files(a.pid as i32, &a.id)) {
+            if let Some(h) = PASTE_HANDLER.get() {
+                h();
+            }
+        }
+        ev
+    }
+}
+
+/// Finder で ⌘V が押されたとき、キーが Finder に届く前に handler を呼ぶ。
+/// キーを一瞬止める仕組み（イベントタップ）はアクセシビリティの許可が要るので、許可されるまで待つ
+pub fn start_file_paste_hook(handler: impl Fn() + Send + Sync + 'static) {
+    if PASTE_HANDLER.set(Box::new(handler)).is_err() {
+        return;
+    }
+    std::thread::spawn(|| unsafe {
+        const SESSION_TAP: u32 = 1;
+        const HEAD_INSERT: u32 = 0;
+        const OPTION_DEFAULT: u32 = 0;
+        let tap = loop {
+            if AXIsProcessTrusted() {
+                let t = ffi::CGEventTapCreate(SESSION_TAP, HEAD_INSERT, OPTION_DEFAULT, 1 << 10, paste_tap, std::ptr::null_mut());
+                if !t.is_null() {
+                    break t;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        };
+        PASTE_TAP.store(tap, Ordering::SeqCst);
+        let source = ffi::CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
+        ffi::CFRunLoopAddSource(ffi::CFRunLoopGetCurrent(), source, ffi::kCFRunLoopCommonModes);
+        ffi::CGEventTapEnable(tap, true);
+        ffi::CFRunLoopRun();
+    });
+}
+
 /// 覚えておいたアプリを前面に戻す
 pub fn activate_target() {
     let pid = TARGET_PID.load(Ordering::SeqCst);

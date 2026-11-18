@@ -107,6 +107,84 @@ pub fn remember_target() {
     }
 }
 
+// ───────── エクスプローラーへの貼り付けで画像をファイルにする ─────────
+
+/// エクスプローラー（デスクトップを含む）のファイル一覧に入力の対象があれば true。
+/// 名前の変更・アドレスバー・検索欄などの文字入力中は false
+fn explorer_wants_files(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetGUIThreadInfo, GUITHREADINFO};
+    if app_from_hwnd(hwnd).is_none_or(|a| a.id != "explorer") {
+        return false;
+    }
+    unsafe {
+        let tid = GetWindowThreadProcessId(hwnd, None);
+        let mut gi = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+        if GetGUIThreadInfo(tid, &mut gi).is_err() || gi.hwndFocus.0.is_null() {
+            // 入力の対象が分からない（前面でないときなど）はファイル一覧とみなす
+            return true;
+        }
+        let mut buf = [0u16; 128];
+        let n = GetClassNameW(gi.hwndFocus, &mut buf) as usize;
+        let class = String::from_utf16_lossy(&buf[..n]);
+        // ファイル一覧（DirectUIHWND）とデスクトップのアイコン（SysListView32）だけ
+        matches!(class.as_str(), "DirectUIHWND" | "SysListView32" | "SHELLDLL_DefView")
+    }
+}
+
+/// パネルから貼る先（覚えておいたウィンドウ）が、ファイルを置ける場所か
+pub fn target_wants_files() -> bool {
+    let h = TARGET_HWND.load(Ordering::SeqCst);
+    h != 0 && explorer_wants_files(HWND(h as *mut _))
+}
+
+static PASTE_HANDLER: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
+/// エクスプローラーで Ctrl+V が押されたとき、キーが届く前に handler を呼ぶ
+pub fn start_file_paste_hook(handler: impl Fn() + Send + Sync + 'static) {
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, GetMessageW, SetWindowsHookExW, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN,
+    };
+
+    if PASTE_HANDLER.set(Box::new(handler)).is_err() {
+        return;
+    }
+
+    unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        unsafe {
+            if code >= 0 && wparam.0 as u32 == WM_KEYDOWN {
+                let k = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+                let held = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| GetAsyncKeyState(vk.0 as i32) < 0;
+                // 手で押した Ctrl+V（VK_V = 0x56）だけ。Shift / Alt / Win 付きは対象外
+                if k.vkCode == 0x56
+                    && (k.flags.0 & LLKHF_INJECTED.0) == 0
+                    && held(VK_CONTROL)
+                    && !held(VK_SHIFT)
+                    && !held(VK_MENU)
+                    && !held(VK_LWIN)
+                    && !held(VK_RWIN)
+                    && explorer_wants_files(GetForegroundWindow())
+                {
+                    if let Some(h) = PASTE_HANDLER.get() {
+                        h();
+                    }
+                }
+            }
+            CallNextHookEx(None, code, wparam, lparam)
+        }
+    }
+
+    std::thread::spawn(|| unsafe {
+        let Ok(_hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), None, 0) else {
+            log::warn!("paste hook failed");
+            return;
+        };
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+    });
+}
+
 pub fn activate_target() {
     let h = TARGET_HWND.load(Ordering::SeqCst);
     if h != 0 {

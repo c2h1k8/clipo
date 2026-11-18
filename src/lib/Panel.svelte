@@ -270,12 +270,12 @@
     return items[focusIdx] ? [items[focusIdx].id] : [];
   }
 
-  async function paste(ids = targetIds(), copyOnly = false, asPath = false, transform: string | null = null) {
+  async function paste(ids = targetIds(), copyOnly = false, asPath = false, transform: string | null = null, asFile = false) {
     if (!ids.length) return;
     menu = null;
     preview = false;
     try {
-      await api.paste(ids, copyOnly, asPath, transform);
+      await api.paste(ids, copyOnly, asPath, transform, asFile);
     } catch (err) {
       showToast(String(err), undefined, 5000);
     }
@@ -617,6 +617,14 @@
           : { label: "翻訳", icon: "globe", hint: `${MOD}T`, run: () => runAction(item) },
       );
     } else {
+      list.push({
+        label: `ファイルとしてコピー${n}`,
+        icon: "copy",
+        run: () => {
+          paste(targetIds(), true, false, null, true);
+          showToast(`${isMac ? "Finder" : "エクスプローラー"}で貼り付けると PNG ファイルになります`);
+        },
+      });
       list.push({ label: "文字起こし", icon: "scan", hint: `${MOD}T`, run: () => runAction(item) });
     }
     const tagNames = tags.filter((t) => item.tags.includes(t.id)).map((t) => t.name);
@@ -868,17 +876,18 @@
       return;
     }
 
-    // #名前 の候補: ↑↓ で選ぶ（選んだ時点で絞り込み）。←→ でカードへ移ると閉じる。Enter は普段どおり貼り付け
-    if (!mod && !e.altKey && tagPrefix != null && tagHits.length) {
-      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-        // 閉じていても、末尾が #… のままなら ↓ で開き直す
-        if (tagOpen || (e.key === "ArrowDown" && TAG_TAIL.test(query))) {
-          e.preventDefault();
-          tagOpen = true;
-          moveTag(e.key === "ArrowDown" ? 1 : -1);
-          return;
-        }
+    // #名前 の候補: ⌥↑↓（Windows は Alt+↑↓）で選ぶ（選んだ時点で絞り込み）。⌥←→ が検索欄の文字カーソルなのと同じ。
+    // 1 段のときは ↑↓ 単体でも選べる（カードの上下移動がないので）。多段の ↑↓ 単体は候補を閉じて段の移動。
+    // ←→ でカードへ移ると閉じる。Enter は普段どおり貼り付け
+    if (!mod && tagPrefix != null && tagHits.length && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+      const forTags = e.altKey || (!paged && (tagOpen || (e.key === "ArrowDown" && TAG_TAIL.test(query))));
+      if (forTags) {
+        e.preventDefault();
+        tagOpen = true;
+        moveTag(e.key === "ArrowDown" ? 1 : -1);
+        return;
       }
+      if (paged) closeTags();
     }
     if (tagOpen) {
       if (e.key === "Escape") {
@@ -1317,7 +1326,7 @@
             {:else}
               <span>{tags.length ? "一致するタグはありません" : "タグがまだありません"}</span>
             {/each}
-            {#if tagHits.length}<small>↑↓ でタグ・←→ でカード・{K.enter} で貼り付け</small>{/if}
+            {#if tagHits.length}<small>{paged ? K.alt : ""}↑↓ でタグ・←→ でカード・{K.enter} で貼り付け</small>{/if}
           </div>
         {/if}
       </label>
@@ -1485,7 +1494,7 @@
             <dt>文字を入力</dt><dd>そのまま検索（{MOD}F）</dd>
             <dt>{K.alt}← / {K.alt}→</dt><dd>検索欄の文字カーソルを移動（{K.shift}で選択）</dd>
             <dt>Tab</dt><dd>履歴 / 保存 を切り替え</dd>
-            <dt>#名前</dt><dd>タグで絞り込み（# だけで候補一覧、↑↓ で選ぶとすぐ絞り込み）</dd>
+            <dt>#名前</dt><dd>タグで絞り込み（# だけで候補一覧、{K.alt}↑↓ で選ぶとすぐ絞り込み。1段なら ↑↓ だけでも可）</dd>
             <dt>{MOD}O</dt><dd>コピー元アプリで絞り込み</dd>
             <dt>{MOD}Y</dt><dd>期間で絞り込み</dd>
             <dt>{MOD}I</dt><dd>種類で絞り込み（検索欄に /画像 /リンク なども可）</dd>

@@ -65,8 +65,153 @@ fn e<E: ToString>(err: E) -> String {
 
 fn remove_files(files: Vec<String>) {
     for f in files {
-        let _ = std::fs::remove_file(f);
+        let p = std::path::Path::new(&f);
+        // コピーしたファイルの控えはフォルダごと（Clipo の files フォルダの中だけ）
+        if p.is_dir() {
+            if p.parent().and_then(|d| d.file_name()).is_some_and(|n| n == BACKUP_DIR) {
+                let _ = std::fs::remove_dir_all(p);
+            }
+        } else {
+            let _ = std::fs::remove_file(p);
+        }
     }
+}
+
+// ───────────────────────── ファイルの控え・画像のファイル化 ─────────────────────────
+
+/// コピーしたファイルの控えを置くフォルダ名（data_dir の下）
+const BACKUP_DIR: &str = "files";
+/// 1 回のコピーで控えを取る合計サイズの上限。これを超えるぶんは控えなし（元ファイル頼み）
+const BACKUP_LIMIT: u64 = 50 * 1024 * 1024;
+/// 画像をファイルとして貼るときの一時置き場（起動時に空にする）
+const EXPORT_DIR: &str = "export";
+
+/// 控えの置き場所: <控えフォルダ>/<元の場所から作った番号>/<元のファイル名>
+fn backup_path(dir: &std::path::Path, original: &str) -> Option<PathBuf> {
+    let name = std::path::Path::new(original).file_name()?;
+    Some(dir.join(fnv1a(original.as_bytes())).join(name))
+}
+
+/// コピーされたファイルの控えを取る（元が消されても貼れるように）。
+/// フォルダは対象外。Mac の APFS では複製(clone)になるので容量はほぼ増えない
+fn backup_files(dir: PathBuf, paths: Vec<String>) {
+    let mut total = 0u64;
+    for p in &paths {
+        let Ok(meta) = std::fs::metadata(p) else { continue };
+        if !meta.is_file() || total + meta.len() > BACKUP_LIMIT {
+            continue;
+        }
+        let Some(dst) = backup_path(&dir, p) else { continue };
+        // 前回の控えと大きさ・更新日時が同じならそのまま
+        let same = std::fs::metadata(&dst).is_ok_and(|b| {
+            b.len() == meta.len() && b.modified().ok() == meta.modified().ok()
+        });
+        if !same {
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::remove_file(&dst);
+            if let Err(err) = std::fs::copy(p, &dst) {
+                log::warn!("backup failed: {p}: {err}");
+                continue;
+            }
+        }
+        total += meta.len();
+    }
+}
+
+/// 貼れるファイルの場所: 元があれば元、消えていれば控え
+fn resolve_file(path: &str, backup: Option<&str>) -> Option<String> {
+    if std::path::Path::new(path).exists() {
+        return Some(path.to_string());
+    }
+    let b = backup_path(std::path::Path::new(backup?), path)?;
+    b.is_file().then(|| b.to_string_lossy().to_string())
+}
+
+/// 画像カードを、名前の付いた PNG ファイルにする（Finder / エクスプローラーに貼る用）
+fn image_as_file(state: &AppState, db: &Db, id: i64, src: &std::path::Path, used: &mut HashSet<String>) -> Res<String> {
+    use chrono::TimeZone;
+    let (created, source) = db.name_info(id).map_err(e)?.unwrap_or((now_ms(), None));
+    let when = chrono::Local
+        .timestamp_millis_opt(created)
+        .single()
+        .map(|t| t.format("%Y-%m-%d %H.%M.%S").to_string())
+        .unwrap_or_default();
+    let head = if source.as_deref() == Some("clipo.screenshot") { "スクリーンショット" } else { "画像" };
+    // 同じ秒に撮ったものを一緒に貼るときは名前がぶつからないよう番号を付ける
+    let mut name = format!("{head} {when}.png");
+    let mut n = 2;
+    while !used.insert(name.clone()) {
+        name = format!("{head} {when} ({n}).png");
+        n += 1;
+    }
+    let dir = state.data_dir.join(EXPORT_DIR).join(id.to_string());
+    std::fs::create_dir_all(&dir).map_err(e)?;
+    let dst = dir.join(&name);
+    if !dst.exists() {
+        std::fs::copy(src, &dst).map_err(e)?;
+    }
+    Ok(dst.to_string_lossy().to_string())
+}
+
+/// いまクリップボードに入っている画像が、どの履歴カードのものか (クリップボードの変更番号, カード id)
+static CLIPBOARD_IMAGE: Mutex<Option<(i64, i64)>> = Mutex::new(None);
+
+fn remember_clipboard_image(count: i64, id: i64) {
+    *CLIPBOARD_IMAGE.lock().unwrap() = Some((count, id));
+}
+
+/// Finder / エクスプローラーで（Clipo を通さず）⌘V / Ctrl+V が押された。
+/// キーが届く前に呼ばれるので、クリップボードの画像を PNG ファイルに差し替える。
+/// 少したったら元の画像に戻す（ほかのアプリでは今まで通り画像が貼れるように）
+fn on_file_manager_paste(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if state.pasting.load(Ordering::SeqCst) || state.paused.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some((count, id)) = *CLIPBOARD_IMAGE.lock().unwrap() else { return };
+    // 画像を入れたあと、別のものがコピーされていたら何もしない
+    if count != platform::change_count() {
+        return;
+    }
+    let files = match load_contents(&state, &[id], "", &PasteVars::default(), false, true) {
+        Ok((mut cs, _)) => match cs.pop() {
+            Some(Content::Files(f)) => f,
+            _ => return,
+        },
+        Err(err) => {
+            log::warn!("image to file failed: {err}");
+            return;
+        }
+    };
+    state.pasting.store(true, Ordering::SeqCst);
+    if let Err(err) = platform::write_files(&files) {
+        log::warn!("image to file failed: {err}");
+    }
+    let swapped = platform::change_count();
+    let app = app.clone();
+    // ここはキー入力の途中なので待たずに戻り、後始末は別スレッドで行う
+    std::thread::spawn(move || {
+        let state = app.state::<AppState>();
+        // 自分の書き込みを監視が拾わないよう、少し待ってから記録の再開
+        std::thread::sleep(Duration::from_millis(400));
+        state.last_count.store(platform::change_count(), Ordering::SeqCst);
+        state.pasting.store(false, Ordering::SeqCst);
+        // 貼り付け先がファイルを読み終えるのを待ってから元の画像に戻す
+        std::thread::sleep(Duration::from_millis(1100));
+        if platform::change_count() != swapped {
+            return; // そのあいだに別のものがコピーされた
+        }
+        let Ok(Some((_, _, Some(p)))) = state.db.lock().unwrap().content(id) else { return };
+        state.pasting.store(true, Ordering::SeqCst);
+        if let Err(err) = write_clipboard(&Content::Image(p.into(), Some(id))) {
+            log::warn!("restore image failed: {err}");
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        state.last_count.store(platform::change_count(), Ordering::SeqCst);
+        state.pasting.store(false, Ordering::SeqCst);
+    });
 }
 
 // ───────────────────────── クリップボード監視 ─────────────────────────
@@ -143,7 +288,7 @@ fn start_screenshot_watcher(app: AppHandle) {
                 state
                     .screenshot_until
                     .store(now_ms() + 3_000, Ordering::SeqCst);
-                if let Err(err) = write_clipboard(&Content::Image(path)) {
+                if let Err(err) = write_clipboard(&Content::Image(path, None)) {
                     log::warn!("screenshot import failed: {err}");
                 }
             }
@@ -258,7 +403,12 @@ fn capture(
         source_id: sid.as_deref(),
         source_icon: sicon.as_deref(),
     };
-    finish_insert(app, state, &item)
+    finish_insert(app, state, &item)?;
+    // Finder / エクスプローラーで ⌘V / Ctrl+V されたらファイルにできるよう覚えておく
+    if let Some(id) = state.db.lock().unwrap().id_by_hash(&hash).map_err(e)? {
+        remember_clipboard_image(state.last_count.load(Ordering::SeqCst), id);
+    }
+    Ok(())
 }
 
 /// コピーされたファイルを「ファイル」カードとして記録（中身はパスを改行でつないだもの）
@@ -270,17 +420,25 @@ fn capture_files(
     files: &[String],
 ) -> Res<()> {
     let text = files.join("\n");
-    let hash = format!("f:{}", fnv1a(text.as_bytes()));
+    // 同じファイルの組み合わせなら、選んだ順番が違っても同じカードにする
+    let mut sorted = files.to_vec();
+    sorted.sort();
+    let hash = format!("f:{}", fnv1a(sorted.join("\n").as_bytes()));
     // 1 つ目のファイルのアイコン（Finder と同じもの）をサムネイルにする
     let dir = state.data_dir.join("icons");
     let thumb = dir.join(format!("file-{}.png", &hash[2..]));
     let thumb = (thumb.exists() || platform::save_file_icon(&files[0], &thumb))
         .then(|| thumb.to_string_lossy().to_string());
     let icon = src.as_ref().and_then(|s| icon_for(state, s, tried));
+    // 控えは裏で取る（大きいファイルでも監視を止めない）
+    let backup = state.data_dir.join(BACKUP_DIR).join(&hash[2..]);
+    let backup_str = backup.to_string_lossy().to_string();
+    let paths = files.to_vec();
+    std::thread::spawn(move || backup_files(backup, paths));
     let item = NewItem {
         kind: "file",
         text: Some(&text),
-        image_path: None,
+        image_path: Some(&backup_str),
         thumb_path: thumb.as_deref(),
         width: None,
         height: None,
@@ -571,7 +729,8 @@ fn send_left_keys(n: usize) -> Res<()> {
 enum Content {
     Text(String),
     Files(Vec<String>),
-    Image(PathBuf),
+    /// 画像ファイルと、履歴のカード id（分かれば）
+    Image(PathBuf, Option<i64>),
 }
 
 fn write_clipboard(c: &Content) -> Res<()> {
@@ -582,7 +741,7 @@ fn write_clipboard(c: &Content) -> Res<()> {
             drop(cb);
             platform::write_files(paths)
         }
-        Content::Image(p) => {
+        Content::Image(p, id) => {
             let img = image::open(p).map_err(e)?.to_rgba8();
             let (w, h) = img.dimensions();
             cb.set_image(arboard::ImageData {
@@ -590,7 +749,11 @@ fn write_clipboard(c: &Content) -> Res<()> {
                 height: h as usize,
                 bytes: img.into_raw().into(),
             })
-            .map_err(e)
+            .map_err(e)?;
+            if let Some(id) = id {
+                remember_clipboard_image(platform::change_count(), *id);
+            }
+            Ok(())
         }
     }
 }
@@ -617,27 +780,41 @@ fn expand_vars(text: &str, vars: &PasteVars, clip: &mut Option<Option<String>>) 
 
 /// 貼る中身と、貼ったあとカーソルを左へ戻す文字数
 /// as_path=true ならファイルをフルパスの文字として貼る
+/// as_file=true なら画像を PNG ファイルとして貼る（Finder / エクスプローラー向け）
 fn load_contents(
     state: &AppState,
     ids: &[i64],
     sep: &str,
     vars: &PasteVars,
     as_path: bool,
+    as_file: bool,
 ) -> Res<(Vec<Content>, usize)> {
     let db = state.db.lock().unwrap();
     let mut out = vec![];
     let mut clip = None;
+    let mut names = HashSet::new();
     for id in ids {
         match db.content(*id).map_err(e)? {
-            Some((k, _, Some(p))) if k == "image" => out.push(Content::Image(p.into())),
-            Some((k, Some(t), _)) if k == "file" => {
+            Some((k, _, Some(p))) if k == "image" && as_file => {
+                let f = image_as_file(state, &db, *id, std::path::Path::new(&p), &mut names)?;
+                if let Some(Content::Files(prev)) = out.last_mut() {
+                    prev.push(f);
+                } else {
+                    out.push(Content::Files(vec![f]));
+                }
+            }
+            Some((k, _, Some(p))) if k == "image" => out.push(Content::Image(p.into(), Some(*id))),
+            Some((k, Some(t), backup)) if k == "file" => {
                 let paths: Vec<String> = t.lines().map(str::to_string).collect();
                 if as_path {
                     out.push(Content::Text(paths.join("\n")));
                     continue;
                 }
-                let alive: Vec<String> =
-                    paths.into_iter().filter(|p| std::path::Path::new(p).exists()).collect();
+                // 元が消えていても控えがあればそれを貼る
+                let alive: Vec<String> = paths
+                    .iter()
+                    .filter_map(|p| resolve_file(p, backup.as_deref()))
+                    .collect();
                 if alive.is_empty() {
                     return Err("ファイルが見つかりません（移動または削除されています）".into());
                 }
@@ -695,7 +872,8 @@ fn list_items(state: State<AppState>, filter: Filter) -> Res<Vec<Item>> {
         }
         if it.kind == "file" {
             let text = state.db.lock().unwrap().original_text(it.id).ok().flatten().unwrap_or_default();
-            it.missing = !text.lines().all(|p| std::path::Path::new(p).exists());
+            let backup = it.image_path.as_deref();
+            it.missing = !text.lines().all(|p| resolve_file(p, backup).is_some());
         }
     }
     Ok(items)
@@ -824,6 +1002,7 @@ fn paste_items(
     copy_only: bool,
     vars: Option<PasteVars>,
     as_path: Option<bool>,
+    as_file: Option<bool>,
     transform: Option<String>,
 ) -> Res<()> {
     if ids.is_empty() {
@@ -831,8 +1010,16 @@ fn paste_items(
     }
     state.queue.lock().unwrap().clear();
     let sep = state.settings.lock().unwrap().multi_separator.clone();
-    let (mut contents, mut cursor_back) =
-        load_contents(&state, &ids, &sep, &vars.unwrap_or_default(), as_path.unwrap_or(false))?;
+    // Finder / エクスプローラーへ貼るときは、画像を自動でファイルにする
+    let as_file = as_file.unwrap_or(false) || (!copy_only && platform::target_wants_files());
+    let (mut contents, mut cursor_back) = load_contents(
+        &state,
+        &ids,
+        &sep,
+        &vars.unwrap_or_default(),
+        as_path.unwrap_or(false),
+        as_file,
+    )?;
     if let Some(t) = transform.as_deref() {
         for c in contents.iter_mut() {
             if let Content::Text(s) = c {
@@ -930,7 +1117,7 @@ fn start_queue(app: AppHandle, state: State<AppState>, ids: Vec<i64>, vars: Opti
     let mut items = std::collections::VecDeque::new();
     for id in &ids {
         // 1 件ずつ（つながない）
-        let (mut cs, _) = load_contents(&state, &[*id], "", &vars, false)?;
+        let (mut cs, _) = load_contents(&state, &[*id], "", &vars, false, false)?;
         if let Some(c) = cs.pop() {
             items.push_back((*id, c));
         }
@@ -1198,6 +1385,8 @@ fn apply_launch_at_login(app: &AppHandle, on: bool) {
 fn init_state(app: &AppHandle) -> Res<AppState> {
     let data_dir = app.path().app_data_dir().map_err(e)?;
     std::fs::create_dir_all(data_dir.join("icons")).map_err(e)?;
+    // 前回、画像をファイルとして貼ったときの一時ファイル
+    let _ = std::fs::remove_dir_all(data_dir.join(EXPORT_DIR));
     let settings_path = app.path().app_config_dir().map_err(e)?.join("settings.json");
     let settings = Settings::load(&settings_path).normalized();
     let db = Db::open(&data_dir.join("clipo.sqlite3")).map_err(e)?;
@@ -1320,6 +1509,8 @@ pub fn run() {
             }
             setup_tray(&handle)?;
             start_monitor(handle.clone());
+            let h = handle.clone();
+            platform::start_file_paste_hook(move || on_file_manager_paste(&h));
             start_screenshot_watcher(handle.clone());
 
             if let Some(panel) = app.get_webview_window(PANEL) {
@@ -1410,5 +1601,40 @@ mod tests {
         let mut clip = Some(None);
         let out = expand_vars("a{カーソル}bc {日付}", &vars, &mut clip);
         assert_eq!(out, format!("a{CURSOR_MARK}bc 2026/11/11"));
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+
+    #[test]
+    fn backup_survives_deleting_original() {
+        let tmp = std::env::temp_dir().join(format!("clipo-test-{}", now_ms()));
+        let src_dir = tmp.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let a = src_dir.join("a.txt");
+        std::fs::write(&a, "hello").unwrap();
+        let folder = src_dir.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let paths = vec![a.to_string_lossy().to_string(), folder.to_string_lossy().to_string()];
+        let backup = tmp.join(BACKUP_DIR).join("abc");
+        backup_files(backup.clone(), paths.clone());
+        let b = backup.to_string_lossy().to_string();
+
+        // 元があるうちは元を貼る
+        assert_eq!(resolve_file(&paths[0], Some(&b)).as_deref(), Some(paths[0].as_str()));
+        // 元を消したら控えを貼る（名前は元のまま）
+        std::fs::remove_file(&a).unwrap();
+        let r = resolve_file(&paths[0], Some(&b)).unwrap();
+        assert!(r.ends_with("a.txt"));
+        assert_eq!(std::fs::read_to_string(&r).unwrap(), "hello");
+        // フォルダは控えなし
+        std::fs::remove_dir(&folder).unwrap();
+        assert!(resolve_file(&paths[1], Some(&b)).is_none());
+        // 履歴から消したら控えも消える
+        remove_files(vec![b.clone()]);
+        assert!(!backup.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -107,9 +107,9 @@ export const api = {
   /** text は画像なら null */
   saveItem: (id: number | null, title: string, keyword: string, text: string | null) =>
     invoke<number>("save_item", { id, title, keyword, text }),
-  /** asPath: ファイルをフルパスの文字として貼る */
-  paste: (ids: number[], copyOnly = false, asPath = false, transform: string | null = null) =>
-    invoke<void>("paste_items", { ids, copyOnly, vars: pasteVars(), asPath, transform }),
+  /** asPath: ファイルをフルパスの文字として貼る / asFile: 画像を PNG ファイルとして貼る */
+  paste: (ids: number[], copyOnly = false, asPath = false, transform: string | null = null, asFile = false) =>
+    invoke<void>("paste_items", { ids, copyOnly, vars: pasteVars(), asPath, asFile, transform }),
   /** 続けて貼る: 1 件目をクリップボードへ。⌘V / Ctrl+V のたびに次へ。件数を返す */
   startQueue: (ids: number[]) => invoke<number>("start_queue", { ids, vars: pasteVars() }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
