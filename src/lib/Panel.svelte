@@ -270,12 +270,12 @@
     return items[focusIdx] ? [items[focusIdx].id] : [];
   }
 
-  async function paste(ids = targetIds(), copyOnly = false, asPath = false, transform: string | null = null) {
+  async function paste(ids = targetIds(), copyOnly = false, asPath = false, transform: string | null = null, asFile = false) {
     if (!ids.length) return;
     menu = null;
     preview = false;
     try {
-      await api.paste(ids, copyOnly, asPath, transform);
+      await api.paste(ids, copyOnly, asPath, transform, asFile);
     } catch (err) {
       showToast(String(err), undefined, 5000);
     }
@@ -617,6 +617,14 @@
           : { label: "翻訳", icon: "globe", hint: `${MOD}T`, run: () => runAction(item) },
       );
     } else {
+      list.push({
+        label: `ファイルとしてコピー${n}`,
+        icon: "copy",
+        run: () => {
+          paste(targetIds(), true, false, null, true);
+          showToast(`${isMac ? "Finder" : "エクスプローラー"}で貼り付けると PNG ファイルになります`);
+        },
+      });
       list.push({ label: "文字起こし", icon: "scan", hint: `${MOD}T`, run: () => runAction(item) });
     }
     const tagNames = tags.filter((t) => item.tags.includes(t.id)).map((t) => t.name);

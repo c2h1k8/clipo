@@ -394,10 +394,11 @@ dependencies = [
 
 [[package]]
 name = "clipo"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arboard",
  "block2",
+ "chrono",
  "enigo",
  "image",
  "log",

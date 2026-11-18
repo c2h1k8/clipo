@@ -1,6 +1,6 @@
 [package]
 name = "clipo"
-version = "0.2.1"
+version = "0.3.0"
 description = "Lightweight clipboard manager"
 license = "MIT"
 authors = ["c2h1k8"]
@@ -29,6 +29,7 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 enigo = "0.6.1"
 log = "0.4.35"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 ureq = { version = "3.5.1", features = ["json", "platform-verifier", "win-system-proxy"] }
 
 
@@ -48,4 +49,4 @@ objc2-vision = "0.3.2"
 block2 = "0.6.2"
 
 [target."cfg(windows)".dependencies]
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_ProcessStatus", "Foundation", "Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Globalization", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_Graphics_Dwm", "Win32_System_Memory"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_ProcessStatus", "Foundation", "Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Globalization", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_Graphics_Dwm", "Win32_System_Memory", "Win32_UI_Input_KeyboardAndMouse"] }

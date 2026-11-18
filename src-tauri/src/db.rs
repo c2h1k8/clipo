@@ -238,9 +238,10 @@ impl Db {
                 "UPDATE items SET used_at = ?1,
                     source_name = COALESCE(?2, source_name),
                     source_id = COALESCE(?3, source_id),
-                    source_icon = COALESCE(?4, source_icon)
+                    source_icon = COALESCE(?4, source_icon),
+                    image_path = COALESCE(image_path, ?6)
                  WHERE id = ?5",
-                params![now, it.source_name, it.source_id, it.source_icon, id],
+                params![now, it.source_name, it.source_id, it.source_icon, id, it.image_path],
             )?;
             return Ok((id, false));
         }
@@ -401,6 +402,21 @@ impl Db {
                 [id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
+            .optional()
+    }
+
+    pub fn id_by_hash(&self, hash: &str) -> rusqlite::Result<Option<i64>> {
+        self.conn
+            .query_row("SELECT id FROM items WHERE hash = ?1", [hash], |r| r.get(0))
+            .optional()
+    }
+
+    /// 画像をファイルにするときの名前づけ用 (created_at, source_id)
+    pub fn name_info(&self, id: i64) -> rusqlite::Result<Option<(i64, Option<String>)>> {
+        self.conn
+            .query_row("SELECT created_at, source_id FROM items WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .optional()
     }
 
