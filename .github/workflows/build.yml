@@ -24,6 +24,12 @@ on:
 permissions:
   contents: write # タグと Release の作成に必要
 
+env:
+  # Rust のバージョンを固定する。stable のままだと新しい Rust が出るたびに
+  # rust-cache のキーが変わり、リリース用キャッシュが一度も当たらなくなる（リリースは間隔が空くため）。
+  # 上げるときはここを書き換える（その次のビルドだけキャッシュなしになる）
+  RUST_TOOLCHAIN: "1.100.0"
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -115,7 +121,9 @@ jobs:
           node-version: 22
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -137,19 +145,11 @@ jobs:
         working-directory: src-tauri
         run: cargo check --locked
 
-  # リリース用: 配布用ビルドを作って下書き Release に添付
-  build:
+  # リリース用（Windows）: 配布用ビルドを作って下書き Release に添付
+  build-windows:
     needs: prepare
     if: needs.prepare.outputs.release == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-latest
-            args: --target universal-apple-darwin --bundles dmg
-          - platform: windows-latest
-            args: --bundles nsis
-    runs-on: ${{ matrix.platform }}
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
 
@@ -158,9 +158,9 @@ jobs:
           node-version: 22
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -183,11 +183,98 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: ${{ matrix.args }}
+          args: --bundles nsis
           releaseId: ${{ needs.prepare.outputs.release_id }}
 
+  # リリース用（Mac）その1: Apple Silicon 用と Intel 用の実行ファイルを別々のジョブで同時にビルドする
+  # （tauri build --target universal-apple-darwin だと 2 つを順番にビルドするので倍かかる）
+  build-mac:
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          # 2 つのジョブは同じ OS なので、ターゲットで分けないとキャッシュが取り合いになる
+          shared-key: release-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - run: npm ci
+
+      # フロントのビルド（beforeBuildCommand）も含む。バンドル（.app / dmg 作成）は bundle-mac でまとめてやる
+      - name: Build binary
+        run: npm run tauri -- build --target ${{ matrix.target }} --no-bundle --ci
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipo-${{ matrix.target }}
+          path: src-tauri/target/${{ matrix.target }}/release/clipo
+          if-no-files-found: error
+          retention-days: 1
+
+  # リリース用（Mac）その2: 2 つの実行ファイルを lipo で 1 つ（両対応）にまとめ、dmg を作って添付
+  bundle-mac:
+    needs: [prepare, build-mac]
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      # tauri bundle はビルドしないが、cargo metadata で target フォルダの場所を調べるので Rust は要る
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - run: npm ci
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: clipo-*
+          path: bins
+
+      - name: Combine into a universal binary
+        run: |
+          out=src-tauri/target/universal-apple-darwin/release
+          mkdir -p "$out"
+          lipo -create bins/clipo-aarch64-apple-darwin/clipo bins/clipo-x86_64-apple-darwin/clipo -output "$out/clipo"
+          chmod +x "$out/clipo"
+          lipo -info "$out/clipo"
+
+      - name: Bundle dmg
+        run: npm run tauri -- bundle --target universal-apple-darwin --bundles dmg --ci
+
+      - name: Upload to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dmg=$(ls src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          echo "$dmg"
+          gh release upload "v${{ needs.prepare.outputs.version }}" "$dmg" --clobber
+
   publish:
-    needs: [prepare, build]
+    needs: [prepare, build-windows, bundle-mac]
     if: needs.prepare.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:

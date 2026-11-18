@@ -33,6 +33,11 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 ureq = { version = "3.5.1", features = ["json", "platform-verifier", "win-system-proxy"] }
 
 
+# 開発ビルド（tauri dev）を軽くする: 依存クレートのデバッグ情報は作らない（自分のコードは今まで通り）。
+# デバッグ情報の生成とリンクが減るぶん速くなり、target フォルダも小さくなる
+[profile.dev.package."*"]
+debug = false
+
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
 codegen-units = 1
