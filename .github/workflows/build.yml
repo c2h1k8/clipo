@@ -106,8 +106,12 @@ jobs:
 
   # コンパイルが通るかだけ確認。
   # main でも動かして、そのキャッシュを main に保存する（PR で保存したキャッシュは他のブランチから使えないため）
+  # リリースのときは publish の後に回す（配布用ビルドと Mac の実行環境を取り合わないように。
+  # 配布用ビルドが通ればコンパイルは確認できているので、ここはキャッシュを残すためだけ）。
+  # リリースしないときは publish が skipped になるので、prepare の直後に動く
   check:
-    needs: prepare
+    needs: [prepare, publish]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
