@@ -3,6 +3,7 @@ mod platform;
 mod settings;
 mod taps;
 mod translate;
+mod updater;
 
 use db::{fnv1a, now_ms, text_hash, Db, ExportFile, Filter, Item, NewItem, SourceApp, Tag};
 use settings::Settings;
@@ -1424,9 +1425,11 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let ocr = MenuItem::with_id(app, "ocr", "範囲を文字起こし", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "設定…", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause", "記録を一時停止", true, None::<&str>)?;
+    let update = updater::new_tray_item(app)?;
     let quit = MenuItem::with_id(app, "quit", "Clipo を終了", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &ocr, &shot, &pause, &settings, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &ocr, &shot, &pause, &settings, &update, &quit])?;
     app.manage(TrayPause(pause.clone()));
+    app.manage(updater::TrayUpdate(update.clone()));
     // macOS はメニューバーに合わせて白黒反転するテンプレート画像、Windows はカラー
     #[cfg(target_os = "macos")]
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
@@ -1466,6 +1469,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 let app = app.clone();
                 std::thread::spawn(move || open_settings_window(&app));
             }
+            "update" => updater::on_tray_click(app),
             "quit" => app.exit(0),
             _ => {}
         })
@@ -1476,6 +1480,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -1512,6 +1517,7 @@ pub fn run() {
             let h = handle.clone();
             platform::start_file_paste_hook(move || on_file_manager_paste(&h));
             start_screenshot_watcher(handle.clone());
+            updater::start_auto_check(handle.clone());
 
             if let Some(panel) = app.get_webview_window(PANEL) {
                 let blur = handle.state::<AppState>().settings.lock().unwrap().panel_blur;
@@ -1560,6 +1566,8 @@ pub fn run() {
             get_paused,
             export_saved,
             import_saved,
+            updater::check_update,
+            updater::install_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Clipo")

@@ -75,9 +75,14 @@ jobs:
           - **Windows**: `Clipo_*_x64-setup.exe`
 
           ### 初回起動の注意
-          このアプリは署名されていないため、初回は警告が出ます。
-          - **Mac**: dmg からアプリケーションへ移したあと、Finder で Clipo を右クリック →「開く」
+          このアプリは Apple / Microsoft の有料の署名をしていないため、最初の 1 回だけ警告が出ます。
+          - **Mac**: dmg からアプリケーションへ移して開く →「開けません」と出たら
+            「システム設定 → プライバシーとセキュリティ」の下の方にある「このまま開く」
           - **Windows**: SmartScreen の「詳細情報」→「実行」
+
+          ### 2 回目からはアプリ内でアップデート
+          v0.4.0 以降はメニューバー（タスクトレイ）の Clipo →「アップデートを確認」、または設定画面から更新できます。
+          この方法なら警告は出ず、Mac のアクセシビリティ・画面収録の許可もそのまま残ります。
           EOF
           # 作成直後は一覧 API に出てこないことがあるので、タグ名で直接引いて再試行する
           find_id() {
@@ -178,13 +183,37 @@ jobs:
             exit 1
           fi
 
-      - name: Build and upload to the draft release
-        uses: tauri-apps/tauri-action@v0
+      - name: Build installer
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          args: --bundles nsis
-          releaseId: ${{ needs.prepare.outputs.release_id }}
+          # アプリ内アップデート用のファイル（setup.exe.sig）に署名する鍵
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri -- build --bundles nsis --config src-tauri/release.conf.json --ci
+
+      # latest.json は publish で Mac の分と合わせて作る
+      - name: Upload to the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          upload() { # <ファイル> <添付名>
+            old=$(gh api "repos/$REPO/releases/$RELEASE_ID/assets" -q ".[] | select(.name == \"$2\") | .id")
+            # 再実行のとき用: 同じ名前の添付が残っていたら消す
+            if [ -n "$old" ]; then
+              gh api -X DELETE "repos/$REPO/releases/assets/$old"
+            fi
+            curl --fail-with-body -sS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @"$1" \
+              "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$2" > /dev/null
+            echo "$2 を添付しました"
+          }
+          exe=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe)
+          upload "$exe" "$(basename "$exe")"
+          upload "$exe.sig" "$(basename "$exe").sig"
 
   # リリース用（Mac）その1: Apple Silicon 用と Intel 用の実行ファイルを別々のジョブで同時にビルドする
   # （tauri build --target universal-apple-darwin だと 2 つを順番にビルドするので倍かかる）
@@ -262,14 +291,52 @@ jobs:
           chmod +x "$out/clipo"
           lipo -info "$out/clipo"
 
-      - name: Bundle dmg
-        run: npm run tauri -- bundle --target universal-apple-darwin --bundles dmg --ci
+      # 自己署名の証明書で署名する。毎回同じ証明書で署名すると、macOS がバージョンが変わっても
+      # 同じアプリと見なすので、アクセシビリティ・画面収録の許可が外れない（ad-hoc 署名だと毎回外れる）。
+      # 信頼されていない証明書は find-identity -v に出ないため、tauri の APPLE_CERTIFICATE は使えない。
+      # 自分でキーチェーンに入れて検索リストに足し、APPLE_SIGNING_IDENTITY の名前で codesign させる
+      - name: Import signing certificate
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERT_P12" ]; then
+            echo "::error::APPLE_CERT_P12 が設定されていません"
+            exit 1
+          fi
+          kc="$RUNNER_TEMP/clipo.keychain-db"
+          kp=$(openssl rand -hex 16)
+          echo "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kp" "$kc"
+          security set-keychain-settings -lut 3600 "$kc"
+          security unlock-keychain -p "$kp" "$kc"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kp" "$kc" > /dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          security find-identity -p codesigning "$kc"
+
+      - name: Bundle app and dmg
+        env:
+          APPLE_SIGNING_IDENTITY: Clipo Self-Signed
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri -- bundle --target universal-apple-darwin --bundles app,dmg --config src-tauri/release.conf.json --ci
+
+      # ad-hoc 署名に戻っていたら許可が毎回外れるので、ここで止める
+      - name: Verify signature
+        run: |
+          app=src-tauri/target/universal-apple-darwin/release/bundle/macos/Clipo.app
+          codesign --verify --deep --strict "$app"
+          codesign -dr - "$app" 2>&1 | tee /dev/stderr | grep -q 'certificate leaf' \
+            || { echo "::error::自己署名の証明書で署名されていません"; exit 1; }
 
       - name: Upload to the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
           REPO: ${{ github.repository }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         # 下書きは公開するまでタグがないので、gh release upload v<version> だと "release not found" になる。
         # prepare が作った Release の ID で直接アップロードする
         run: |
@@ -277,26 +344,73 @@ jobs:
             echo "::error::release_id が空です（成果物を添付できないので止めます）"
             exit 1
           fi
-          dmg=$(ls src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
-          name=$(basename "$dmg")
-          echo "$dmg"
-          # 再実行のとき用: 同じ名前の添付が残っていたら消す
-          old=$(gh api "repos/$REPO/releases/$RELEASE_ID/assets" -q ".[] | select(.name == \"$name\") | .id")
-          if [ -n "$old" ]; then
-            gh api -X DELETE "repos/$REPO/releases/assets/$old"
-          fi
-          curl --fail-with-body -sS -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary @"$dmg" \
-            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$name" > /dev/null
-          echo "$name を添付しました"
+          upload() { # <ファイル> <添付名>
+            old=$(gh api "repos/$REPO/releases/$RELEASE_ID/assets" -q ".[] | select(.name == \"$2\") | .id")
+            # 再実行のとき用: 同じ名前の添付が残っていたら消す
+            if [ -n "$old" ]; then
+              gh api -X DELETE "repos/$REPO/releases/assets/$old"
+            fi
+            curl --fail-with-body -sS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @"$1" \
+              "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$2" > /dev/null
+            echo "$2 を添付しました"
+          }
+          bundle=src-tauri/target/universal-apple-darwin/release/bundle
+          dmg=$(ls $bundle/dmg/*.dmg)
+          upload "$dmg" "$(basename "$dmg")"
+          # アプリ内アップデート用
+          tgz="Clipo_${VERSION}_universal.app.tar.gz"
+          upload "$bundle/macos/Clipo.app.tar.gz" "$tgz"
+          upload "$bundle/macos/Clipo.app.tar.gz.sig" "$tgz.sig"
 
   publish:
     needs: [prepare, build-windows, bundle-mac]
     if: needs.prepare.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
+      # アプリ内アップデートが見に行く latest.json（.../releases/latest/download/latest.json）を作って添付する
+      - name: Attach latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          assets=$(gh api "repos/$REPO/releases/$RELEASE_ID/assets")
+          asset_id() { echo "$assets" | jq -r --arg n "$1" '.[] | select(.name == $n) | .id'; }
+          sig_of() { # <添付名> → その .sig の中身
+            id=$(asset_id "$1.sig")
+            [ -n "$id" ] || { echo "::error::$1.sig がありません" >&2; exit 1; }
+            gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$id"
+          }
+          mac="Clipo_${VERSION}_universal.app.tar.gz"
+          win=$(echo "$assets" | jq -r '.[] | select(.name | endswith("-setup.exe")) | .name')
+          [ -n "$win" ] || { echo "::error::Windows の setup.exe がありません"; exit 1; }
+          mac_sig=$(sig_of "$mac")
+          win_sig=$(sig_of "$win")
+          url="https://github.com/$REPO/releases/download/v$VERSION"
+          jq -n --arg v "$VERSION" --arg d "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg mu "$url/$mac" --arg ms "$mac_sig" --arg wu "$url/$win" --arg ws "$win_sig" '{
+              version: $v, pub_date: $d, notes: "",
+              platforms: {
+                "darwin-aarch64": {url: $mu, signature: $ms},
+                "darwin-x86_64": {url: $mu, signature: $ms},
+                "windows-x86_64": {url: $wu, signature: $ws}
+              }
+            }' > latest.json
+          cat latest.json
+          old=$(asset_id latest.json)
+          if [ -n "$old" ]; then
+            gh api -X DELETE "repos/$REPO/releases/assets/$old"
+          fi
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @latest.json \
+            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=latest.json" > /dev/null
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -306,4 +420,5 @@ jobs:
           echo "$assets"
           echo "$assets" | grep -q '\.dmg$' || { echo "::error::Mac の dmg が添付されていません"; exit 1; }
           echo "$assets" | grep -q 'setup\.exe$' || { echo "::error::Windows の exe が添付されていません"; exit 1; }
+          echo "$assets" | grep -qx 'latest\.json' || { echo "::error::latest.json が添付されていません"; exit 1; }
           gh release edit "$tag" --repo "${{ github.repository }}" --draft=false --latest
