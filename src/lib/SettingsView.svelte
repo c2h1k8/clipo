@@ -3,6 +3,7 @@
   import { api, isMac, CARD_SIZES, TAG_COLORS, type CardSize, type Settings, type SourceApp, type Tag } from "./api";
   import ShortcutInput from "./ShortcutInput.svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { getVersion } from "@tauri-apps/api/app";
 
   let s = $state<Settings | null>(null);
   let tags = $state<Tag[]>([]);
@@ -14,6 +15,34 @@
   let addApp = $state("");
   let ioMsg = $state("");
   let importInput = $state<HTMLInputElement | null>(null);
+  let version = $state("");
+  let latest = $state<string | null>(null);
+  let updateMsg = $state("");
+  let updating = $state(false);
+
+  async function checkUpdate() {
+    updating = true;
+    updateMsg = "確認中…";
+    try {
+      const u = await api.checkUpdate();
+      latest = u.latest;
+      updateMsg = u.latest ? "" : "最新版です";
+    } catch (err) {
+      updateMsg = `確認できませんでした: ${err}`;
+    }
+    updating = false;
+  }
+
+  async function installUpdate() {
+    updating = true;
+    updateMsg = "ダウンロード中…（終わると Clipo が再起動します）";
+    try {
+      await api.installUpdate();
+    } catch (err) {
+      updateMsg = `アップデートできませんでした: ${err}`;
+      updating = false;
+    }
+  }
 
   function appName(id: string) {
     return apps.find((a) => a.source_id === id)?.source_name ?? id;
@@ -122,6 +151,7 @@
       tags = await api.listTags();
       apps = (await api.sourceApps()).filter((a) => !a.source_id.startsWith("clipo."));
       trusted = await api.accessibilityStatus();
+      version = await getVersion();
     })();
     const t = setInterval(async () => (trusted = await api.accessibilityStatus()), 3000);
     return () => clearInterval(t);
@@ -327,6 +357,16 @@
       <div class="row">
         <label class="check"><input type="checkbox" bind:checked={s.launch_at_login} /> ログイン時に起動</label>
       </div>
+      <div class="row">
+        <span>アップデート<small>今の版: v{version}{latest ? ` → 新しい版 v${latest} があります` : ""}</small></span>
+        {#if latest}
+          <button class="primary" onclick={installUpdate} disabled={updating}>アップデートして再起動</button>
+        {:else}
+          <button onclick={checkUpdate} disabled={updating}>確認する</button>
+        {/if}
+      </div>
+      {#if updateMsg}<p class="help">{updateMsg}</p>{/if}
+      <p class="help">新しい版は自動で確認し、見つかるとメニューバー{isMac ? "" : "（タスクトレイ）"}の Clipo に「アップデートして再起動」が出ます。アプリ内でアップデートすれば、許可の設定はやり直さなくて済みます。</p>
     </section>
 
     <footer>
