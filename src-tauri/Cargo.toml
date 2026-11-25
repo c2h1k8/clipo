@@ -1,6 +1,6 @@
 [package]
 name = "clipo"
-version = "0.3.1"
+version = "0.4.1"
 description = "Lightweight clipboard manager"
 license = "MIT"
 authors = ["c2h1k8"]
@@ -31,6 +31,7 @@ enigo = "0.6.1"
 log = "0.4.35"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 ureq = { version = "3.5.1", features = ["json", "platform-verifier", "win-system-proxy"] }
+tauri-plugin-updater = "2.14.1"
 
 
 # 開発ビルド（tauri dev）を軽くする: 依存クレートのデバッグ情報は作らない（自分のコードは今まで通り）。

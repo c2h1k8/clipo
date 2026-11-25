@@ -132,7 +132,11 @@ export const api = {
   accessibilityStatus: () => invoke<boolean>("accessibility_status"),
   openAccessibility: () => invoke<void>("open_accessibility"),
   platform: () => invoke<string>("platform_name"),
+  checkUpdate: () => invoke<UpdateInfo>("check_update"),
+  installUpdate: () => invoke<void>("install_update"),
 };
+
+export type UpdateInfo = { current: string; latest: string | null };
 
 /** 差し込み記号 {日付} {時刻} の値（ローカル時刻） */
 function pasteVars() {
