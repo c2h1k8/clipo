@@ -486,6 +486,7 @@ fn show_panel(app: &AppHandle) {
         place_panel(&win, &m, h);
     }
     let _ = win.show();
+    platform::force_foreground(&win);
     let _ = win.set_focus();
     let _ = app.emit_to(PANEL, "panel-shown", ());
 }

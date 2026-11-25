@@ -185,6 +185,32 @@ pub fn start_file_paste_hook(handler: impl Fn() + Send + Sync + 'static) {
     });
 }
 
+/// ウィンドウを確実に前面に出す。
+/// Windows は「一度も前面に出たことのないアプリ」が自分のウィンドウを前に出すのを止める。
+/// RegisterHotKey のショートカットやトレイのクリックなら許可されるが、修飾キーの 2 回押し
+/// （低レベルフックで検出）では許可されず、起動直後はパネルが出ない。
+/// いま前面にあるウィンドウの入力に一時的につなぐと、前面に出せるようになる
+pub fn force_foreground(win: &tauri::WebviewWindow) {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::BringWindowToTop;
+    let Ok(h) = win.hwnd() else { return };
+    let hwnd = HWND(h.0);
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg == hwnd {
+            return;
+        }
+        let fg_tid = GetWindowThreadProcessId(fg, None);
+        let my_tid = GetCurrentThreadId();
+        let attached = fg_tid != 0 && fg_tid != my_tid && AttachThreadInput(fg_tid, my_tid, true).as_bool();
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        if attached {
+            let _ = AttachThreadInput(fg_tid, my_tid, false);
+        }
+    }
+}
+
 pub fn activate_target() {
     let h = TARGET_HWND.load(Ordering::SeqCst);
     if h != 0 {
