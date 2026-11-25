@@ -218,6 +218,9 @@ pub fn start_file_paste_hook(handler: impl Fn() + Send + Sync + 'static) {
 }
 
 /// 覚えておいたアプリを前面に戻す
+/// Windows 用（macOS は set_focus だけで前面に出られる）
+pub fn force_foreground(_win: &tauri::WebviewWindow) {}
+
 pub fn activate_target() {
     let pid = TARGET_PID.load(Ordering::SeqCst);
     if pid == 0 {
